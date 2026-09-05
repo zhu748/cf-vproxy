@@ -122,6 +122,16 @@ const SUB_MEM_TTL_MS = 30_000;
 let subMem: { at: number; cache: SubCache } | null = null;
 let poolCache: { key: string; pool: ProxyPool } | null = null;
 
+/** v1.8.0：读取 KV 订阅缓存的原始时间戳（epoch ms，无缓存/读失败返回 0）—— cron 判新鲜度用 */
+export async function subscriptionCachedAt(env: Env): Promise<number> {
+  try {
+    const cache = (await env.VPROXY_KV.get(SUB_CACHE_KEY, "json")) as SubCache | null;
+    return cache && typeof cache.at === "number" ? cache.at : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export async function resolveProxyPool(
   env: Env,
   cfg: VProxyConfig,

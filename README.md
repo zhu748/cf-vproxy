@@ -4,6 +4,24 @@
 > 专为 Cloudflare Workers（免费计划即可）设计。转换层逻辑与原项目对齐，去掉了 reCAPTCHA 突破、
 > TLS 指纹伪装、mihomo 代理内核等 Workers 沙箱无法实现的部分。
 >
+> **v1.8.0 更新（数据保护 + 协议感知错误 + 配额节流）**：
+> ① **修复管理端测速清空 KV 健康记录的破坏性 bug**——`/admin/proxies/test-all`、`/admin/proxy/test`
+> 在冷启动 isolate 上直接测速，会把 KV 健康快照覆盖成"仅含本次测速节点"，其余节点的历史健康度
+> （胜出记忆/冷却/延迟 EMA）全部丢失；现已先 `ensureHealthLoaded` 再写入。`/admin/health` 查询
+> 同样先恢复快照（面板不再显示"暂无数据"）；
+> ② **协议感知错误响应**——401/403/404/413/503/500 此前一律 OpenAI 错误格式，Claude Code 等
+> Anthropic 客户端解析不到 `error.type`、Gemini SDK 解析不到 `error.status`；现按请求路径返回
+> 各协议原生错误结构（Anthropic `{type:"error"}` / Gemini `{error:{code,status}}`，繁忙 503 附
+> Retry-After）；
+> ③ **Cron 订阅刷新按 `subscription_refresh_minutes` 节流**——此前每 15 分钟一跳都无条件拉订阅
+> + 写 KV（免费计划每天白耗 ~96 次 KV 写与 96 次订阅出站请求）；cron 现在还会顺手刷
+> 用量/健康度/指标三类统计；
+> ④ **修复订阅强制刷新"先删后拉"的可用性回退**——拉取失败时旧缓存已丢失，代理池退回静态列表；
+> 现在成功才覆盖、失败保留旧缓存；
+> ⑤ **TTS 上游错误透传**（此前丢弃错误体只剩 HTTP 状态码，429 的 Retry-After 一并丢失）、
+> 客户端 Key 常量时间比对（与 ADMIN_TOKEN 硬化对齐）、`POST /admin/config` 落盘前整体
+> sanitize（KV 不再堆积未知脏字段）、多候选失败响应体主动 cancel（防泄漏）；新增 14 项单测（162 项全绿）。
+>
 > **v1.7.0 更新（思考摘要分流 + 流式基础设施统一）**：
 > ① **修复思考摘要泄漏正文**——Gemini `thought:true` parts 此前被所有响应转换器当普通文本吐给客户端
 > （Anthropic 路径默认开启 `includeThoughts`，Claude Code 用户会看到内部思考混入回复）；现在
@@ -83,6 +101,10 @@ generativelanguage.googleapis.com  （Gemini 官方 API，你的单个 API Key�
 | **请求闸门** | **v1.6.0**：`max_concurrent_requests` 全局并发门（超出 503 + `Retry-After`）；`max_request_mb` 请求体上限（超出 413，content-length 预检 + 实测复核） |
 | **思考摘要分流** | **v1.7.0**：Gemini `includeThoughts` 思考摘要在 Anthropic 端点转为 Claude 原生 `thinking` 块（流式含 thinking_delta/signature_delta 完整事件序列）、OpenAI 端点转为 `reasoning_content` 字段（DeepSeek R1 事实标准）—— 不再混入正文 |
 | **流式基础设施** | **v1.7.0**：全部三协议流式路径统一 10s ping 保活（长思考请求不被空闲超时掐断）+ 客户端断开即取消上游（不烧无效 token）+ 流结束（含断开）幂等记录用量 |
+| **协议感知错误** | **v1.8.0**：401/403/404/413/503/500 按请求路径返回各协议原生错误结构 —— Anthropic 客户端收到 `{type:"error", error:{type,...}}`、Gemini 客户端收到 `{error:{code,status,...}}`、OpenAI 客户端收到 `{error:{message,type,code}}`；繁忙 503 附 `Retry-After` |
+| **健康数据保护** | **v1.8.0**：管理端测速/健康查询先从 KV 恢复快照再写入 —— 修复冷启动 isolate 直接测速会清空其余节点历史健康度的破坏性 bug；客户端 Key 常量时间比对 |
+| **Cron 配额节流** | **v1.8.0**：订阅刷新按 `subscription_refresh_minutes` 判新鲜度（此前每跳无条件拉取+写 KV）；每跳顺手刷用量/健康度/指标统计 |
+
 | 对话能力 | 纯文本、图片输入（base64 / URL / data URI）、工具调用（function calling 双向转换，含流式增量）、**n 多候选**（非流式 `n>1` 并发 n 次上游请求合并 choices，受 max_n 上限保护） |
 | **官方模型表** | **v1.4.0**：内置表为官方 ListModels 实拉数据（构建时生成，含 54 个模型的官方元数据）；运行时在面板「模型」页一键 **从官方重新拉取**（用当前上游 Key 调官方接口，自动分页、代理适配，KV 持久化立即生效），可一键恢复内置表；`/v1/models`、`/v1beta/models`、模型校验均动态跟随 |
 | **假流式** | **v1.5.0 全端点**：模型名前缀 `fake-` / `假流式-`（别名目标同样生效）→ 上游非流式请求 + 合成流式输出（OpenAI/Responses/Gemini 按码点切 ≤8 块，Anthropic 整段单 delta，与原项目逐端点对齐）；`aggregate_stream=true` 时 OpenAI/Anthropic/Responses 端点全部聚合（Gemini 原生仅认前缀，同原项目）；模型列表自动暴露三变体 |

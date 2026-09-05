@@ -175,7 +175,9 @@ async function handleMultiCandidate(
     }
     const resp = s.value;
     if (!resp.ok) {
+      // v1.8.0：首个错误响应留给 mapUpstreamError 消费，其余错误响应体主动 cancel（防泄漏）
       if (!firstErrorResp) firstErrorResp = resp;
+      else void resp.body?.cancel().catch(() => {});
       continue;
     }
     try {

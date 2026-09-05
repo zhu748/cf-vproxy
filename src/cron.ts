@@ -11,16 +11,17 @@
 // 与 cron 表达式解耦（cron 只负责心跳，实际节奏由配置决定）。
 import type { Env } from "./config.ts";
 import { loadConfig } from "./config.ts";
-import { resolveProxyPool, refreshSubscription, testProxy } from "./proxy/proxyfetch.ts";
-import { recordProxySuccess, recordProxyFailure, flushHealthNow, ensureHealthLoaded, sweepDue, keepaliveDue } from "./racing.ts";
+import { resolveProxyPool, refreshSubscription, subscriptionCachedAt, testProxy } from "./proxy/proxyfetch.ts";
+import { recordProxySuccess, recordProxyFailure, flushHealthNow, ensureHealthLoaded, flushHealthIfDue, sweepDue, keepaliveDue, subscriptionDue } from "./racing.ts";
 import { flushMetrics } from "./metrics.ts";
+import { flushIfDue } from "./usage.ts";
 
 export const LAST_SWEEP_KEY = "cron:last_sweep_at";
 export const LAST_KEEPALIVE_KEY = "cron:last_keepalive_at";
 
 const KEEPALIVE_TIMEOUT_MS = 30_000; // 对齐原项目 requestTimeout
-// sweepDue / keepaliveDue 纯逻辑判定在 src/racing.ts（无 Workers 依赖，可单测）；此处 re-export
-export { sweepDue, keepaliveDue };
+// sweepDue / keepaliveDue / subscriptionDue 纯逻辑判定在 src/racing.ts（无 Workers 依赖，可单测）；此处 re-export
+export { sweepDue, keepaliveDue, subscriptionDue };
 
 // ---------- 巡检执行 ----------
 
@@ -87,7 +88,7 @@ export interface ScheduledReport {
   sweep: SweepReport | null;
   sweep_skipped: boolean;
   keepalive: { url: string; status: number | null; error?: string } | null;
-  subscription: { refreshed: boolean; proxies?: number; skipped?: number } | null;
+  subscription: { refreshed: boolean; proxies?: number; skipped?: number; skipped_reason?: string } | null;
 }
 
 /** scheduled 事件入口：健康巡检 + 订阅刷新 + keepalive ping + 统计落盘 */
@@ -111,9 +112,16 @@ export async function runScheduledTasks(env: Env): Promise<ScheduledReport> {
   }
 
   // 2. 订阅主动刷新（对齐原项目定时差异更新；失败不阻塞）
+  //    v1.8.0：按 subscription_refresh_minutes 判新鲜度 —— 此前每跳（15 分钟）都无条件
+  //    拉订阅 + 写 KV，免费计划每天白耗 ~96 次 KV 写与 96 次订阅出站请求。
   if (cfg.subscription) {
-    const cache = await refreshSubscription(env, cfg.subscription).catch(() => null);
-    report.subscription = cache ? { refreshed: true, proxies: cache.proxies.length, skipped: cache.skipped } : { refreshed: false };
+    const cachedAt = await subscriptionCachedAt(env);
+    if (subscriptionDue(cachedAt, cfg.subscription_refresh_minutes, now)) {
+      const cache = await refreshSubscription(env, cfg.subscription).catch(() => null);
+      report.subscription = cache ? { refreshed: true, proxies: cache.proxies.length, skipped: cache.skipped } : { refreshed: false };
+    } else {
+      report.subscription = { refreshed: false, skipped_reason: "cache_fresh" };
+    }
   }
 
   // 3. keepalive ping（首次立即发送，对齐原项目 Start 行为）
@@ -141,7 +149,9 @@ export async function runScheduledTasks(env: Env): Promise<ScheduledReport> {
     await env.VPROXY_KV.put(LAST_KEEPALIVE_KEY, String(now)).catch(() => {});
   }
 
-  // 4. 顺手落盘统计（省一个窗口）
+  // 4. 顺手落盘统计（省一个窗口）：用量、健康度与指标一起刷
+  await flushIfDue(env).catch(() => {});
+  await flushHealthIfDue(env).catch(() => {});
   await flushMetrics(env).catch(() => {});
   return report;
 }

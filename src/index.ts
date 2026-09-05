@@ -28,7 +28,7 @@ import { handleChatCompletions, handleOpenAIModels } from "./handlers/openai.ts"
 import { handleResponses } from "./handlers/responses.ts";
 import { handleAudioSpeech } from "./handlers/audio.ts";
 import { handleImagesGenerations, handleImagesEdits } from "./handlers/images.ts";
-import { errOpenAI, json } from "./convert/common.ts";
+import { json, protocolErrorResponse, tokensEqual } from "./convert/common.ts";
 import type { Env } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { resolveProxyPool } from "./proxy/proxyfetch.ts";
@@ -42,7 +42,7 @@ import { matchApiRoute, NEEDS_UPSTREAM, type ApiRoute } from "./router.ts";
 import { acquireSlot, bodyLimitViolation } from "./gate.ts";
 import { withFakeVariants } from "./fakestream.ts";
 
-const VERSION = "1.7.0";
+const VERSION = "1.8.0";
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -175,7 +175,8 @@ export default {
         key: maskClientKey(extractClientKey(req)),
         ok: false,
       });
-      return withCors(errOpenAI(500, "internal error: " + message));
+      // v1.8.0：内部错误按协议家族返回 —— Anthropic/Gemini 客户端拿到各自原生的错误结构
+      return withCors(protocolErrorResponse(protocolOf(url.pathname), 500, "internal error: " + message));
     }
   },
 
@@ -203,18 +204,24 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
 
   // ===== 业务端点：加载配置 + 鉴权 =====
   const cfg = await loadConfig(env);
+  const proto = protocolOf(path);
   if (cfg.api_keys.length === 0) {
-    return errOpenAI(403, "服务未配置任何客户端 API Key：请打开 Web 面板 /admin 配置，或通过 wrangler secret（API_KEYS）提供");
+    return protocolErrorResponse(
+      proto,
+      403,
+      "服务未配置任何客户端 API Key：请打开 Web 面板 /admin 配置，或通过 wrangler secret（API_KEYS）提供",
+    );
   }
   const clientKey = extractClientKey(req);
-  if (!clientKey || !cfg.api_keys.includes(clientKey)) {
-    return errOpenAI(401, "Invalid API key");
+  // v1.8.0：常量时间比对（与 ADMIN_TOKEN 的 tokensEqual 硬化对齐，缓解时序侧信道）
+  if (!clientKey || !cfg.api_keys.some((k) => tokensEqual(k, clientKey))) {
+    return protocolErrorResponse(proto, 401, "Invalid API key");
   }
 
   // ===== 路由匹配（纯路由表见 src/router.ts）=====
   const routeInfo: ApiRoute = matchApiRoute(req.method, path);
   if (routeInfo.kind === "unknown") {
-    return errOpenAI(404, "未知的路径：" + path + "，可用端点见 GET /");
+    return protocolErrorResponse(proto, 404, "未知的路径：" + path + "，可用端点见 GET /");
   }
 
   // ===== 闸门 1：请求体上限（max_request_mb）=====
@@ -223,15 +230,15 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
   if (req.method === "POST" || req.method === "PUT") {
     const maxBytes = cfg.max_request_mb * 1024 * 1024;
     const pre = bodyLimitViolation(req.headers.get("content-length"), 0, maxBytes);
-    if (pre) return errOpenAI(413, pre);
+    if (pre) return protocolErrorResponse(proto, 413, pre);
     let body: ArrayBuffer;
     try {
       body = await req.arrayBuffer();
     } catch {
-      return errOpenAI(400, "Invalid request body");
+      return protocolErrorResponse(proto, 400, "Invalid request body");
     }
     const post = bodyLimitViolation(null, body.byteLength, maxBytes);
-    if (post) return errOpenAI(413, post);
+    if (post) return protocolErrorResponse(proto, 413, post);
     const headers = new Headers(req.headers);
     headers.delete("content-length");
     headers.delete("transfer-encoding");
@@ -241,16 +248,12 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
   // ===== 闸门 2：全局并发门（max_concurrent_requests，超出 503 + Retry-After）=====
   const slot = acquireSlot(cfg.max_concurrent_requests);
   if (!slot.acquired) {
-    return json(
-      {
-        error: {
-          message: "服务繁忙：在飞请求已达上限 " + cfg.max_concurrent_requests + "（max_concurrent_requests），请稍后重试",
-          type: "api_error",
-          code: "server_busy",
-        },
-      },
+    // v1.8.0：繁忙响应按协议家族返回（旧实现固定 OpenAI 形态，Anthropic/Gemini 客户端解析不到对应字段）
+    return protocolErrorResponse(
+      proto,
       503,
-      { "retry-after": "1" },
+      "服务繁忙：在飞请求已达上限 " + cfg.max_concurrent_requests + "（max_concurrent_requests），请稍后重试",
+      { code: "server_busy", retryAfter: "1" },
     );
   }
 
@@ -288,7 +291,7 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
       case "openai_model_detail": {
         const id = routeInfo.model ?? "";
         if (!withFakeVariants(listChatModels()).includes(id)) {
-          return errOpenAI(404, "模型 '" + id + "' 不存在（可用模型见 GET /v1/models）");
+          return protocolErrorResponse(proto, 404, "模型 '" + id + "' 不存在（可用模型见 GET /v1/models）");
         }
         return json({ id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "google" });
       }
@@ -305,7 +308,7 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
       case "gemini_native":
         return await handleGeminiNative(routeInfo.model ?? "", routeInfo.action ?? "", req, hctx);
     }
-    return errOpenAI(404, "未知的路径：" + path + "，可用端点见 GET /");
+    return protocolErrorResponse(proto, 404, "未知的路径：" + path + "，可用端点见 GET /");
   } finally {
     slot.release();
   }

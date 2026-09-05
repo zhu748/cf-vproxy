@@ -122,6 +122,15 @@ export function keepaliveDue(keepaliveUrl: string, keepaliveIntervalSec: number,
   return now - lastAt >= interval;
 }
 
+/** 是否该主动刷新订阅（v1.8.0）：从未拉过 或 缓存距上次拉取 ≥ refresh 分钟。
+ *  此前 cron 每跳（15 分钟）都无条件拉订阅 + 写 KV —— 无视 subscription_refresh_minutes，
+ *  免费计划每天白耗 ~96 次 KV 写与 96 次订阅出站请求。 */
+export function subscriptionDue(cacheAt: number, refreshMinutes: number, now: number): boolean {
+  if (!cacheAt) return true;
+  const interval = Math.max(5, refreshMinutes) * 60_000;
+  return now - cacheAt >= interval;
+}
+
 // ---------- 健康记录 ----------
 
 export interface ProxyHealth {

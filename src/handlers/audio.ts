@@ -5,7 +5,7 @@
 // WAV 头（16bit 单声道，采样率取上游 mime 的 rate= 参数，默认 24000），pcm 返回裸 L16。
 import { errOpenAI } from "../convert/common.ts";
 import type { GPart } from "../types.ts";
-import { callGemini, resolveModel, type HandlerCtx } from "../upstream.ts";
+import { callGemini, mapUpstreamError, resolveModel, type HandlerCtx } from "../upstream.ts";
 import { recordUsage, scheduleFlush } from "../usage.ts";
 
 export const DEFAULT_TTS_MODEL = "gemini-3.1-flash-tts-preview";
@@ -124,8 +124,9 @@ export async function handleAudioSpeech(req: Request, ctx: HandlerCtx): Promise<
     return errOpenAI(502, "upstream request failed: " + (e instanceof Error ? e.message : String(e)));
   }
   if (!upstream.ok) {
-    const message = "upstream error HTTP " + upstream.status;
-    return errOpenAI(upstream.status === 429 ? 429 : 502, message, "server_error");
+    // v1.8.0：改用 mapUpstreamError —— 旧实现丢弃上游错误体（只剩 "upstream error HTTP 500"），
+    // 音色/模型类 400 的真实原因与 429 的 Retry-After 头全部丢失，与 images 端点行为不一致
+    return await mapUpstreamError(upstream, "openai");
   }
   let g: { candidates?: Array<{ content?: { parts?: GPart[] } }>; usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number } };
   try {

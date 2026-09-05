@@ -144,12 +144,56 @@ export function tokensEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-export function errAnthropic(status: number, type: string, message: string): Response {
-  return json({ type: "error", error: { type, message } }, status);
+export function errAnthropic(status: number, type: string, message: string, headers?: Record<string, string>): Response {
+  return json({ type: "error", error: { type, message } }, status, headers);
 }
 
-export function errGemini(status: number, message: string, status_?: string): Response {
-  return json({ error: { code: status, message, status: status_ ?? "INVALID_ARGUMENT" } }, status);
+export function errGemini(status: number, message: string, status_?: string, headers?: Record<string, string>): Response {
+  return json({ error: { code: status, message, status: status_ ?? "INVALID_ARGUMENT" } }, status, headers);
+}
+
+// ===== 协议感知错误响应（v1.8.0） =====
+
+/**
+ * 按协议家族返回客户端错误：Anthropic 客户端收到 {type:"error",...}，
+ * Gemini 客户端收到 {error:{code,...}}，其余（openai/other）收到 OpenAI 形态。
+ * v1.8.0 之前 index.ts 的 401/403/404/413/503/500 一律 OpenAI 格式 ——
+ * Claude Code 等 Anthropic 客户端解析不到 error.type，Gemini SDK 同理。
+ */
+export function protocolErrorResponse(
+  protocol: string,
+  status: number,
+  message: string,
+  opts?: { code?: string; retryAfter?: string },
+): Response {
+  const retryHeaders = opts?.retryAfter ? { "retry-after": opts.retryAfter } : undefined;
+  if (protocol === "anthropic") {
+    const type =
+      status === 401
+        ? "authentication_error"
+        : status === 403
+          ? "permission_error"
+          : status === 400 || status === 404 || status === 413
+            ? "invalid_request_error"
+            : "api_error"; // 429/500/503/…
+    return errAnthropic(status, type, message, retryHeaders);
+  }
+  if (protocol === "gemini") {
+    const s =
+      status === 401
+        ? "UNAUTHENTICATED"
+        : status === 403
+          ? "PERMISSION_DENIED"
+          : status === 404
+            ? "NOT_FOUND"
+            : status === 429
+              ? "RESOURCE_EXHAUSTED"
+              : status >= 500
+                ? "UNAVAILABLE"
+                : "INVALID_ARGUMENT";
+    return errGemini(status, message, s, retryHeaders);
+  }
+  return errOpenAI(status, message, opts?.code, retryHeaders);
 }
 
 export function json(obj: unknown, status = 200, headers?: Record<string, string>): Response {

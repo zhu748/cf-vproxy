@@ -210,7 +210,6 @@ async function fileToInline(file: unknown): Promise<{ mime_type: string; data: s
 }
 
 async function collectImages(fd: FormData): Promise<Array<{ mime_type: string; data: string }>> {
-  const keys = ["image", "image[]", "mask[]"];
   const out: Array<{ mime_type: string; data: string }> = [];
   // 兼容 image、image[]、image[0..N] 三种字段名
   for (const key of new Set([...fd.keys()])) {
@@ -222,7 +221,6 @@ async function collectImages(fd: FormData): Promise<Array<{ mime_type: string; d
       }
     }
   }
-  void keys;
   return out;
 }
 

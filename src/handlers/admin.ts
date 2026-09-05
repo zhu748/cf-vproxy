@@ -22,10 +22,11 @@ import { geminiBase } from "../upstream.ts";
 import { clearLogs, listLogs } from "../logs.ts";
 import { renderPanelHtml } from "./panel.ts";
 import type { VProxyConfig } from "../types.ts";
-import { allHealthRecords, averageLatency, flushHealthNow, healthMapSnapshot, recordProxyFailure, recordProxySuccess, resetHealth, sanitizeRacingConfig } from "../racing.ts";
+import { allHealthRecords, averageLatency, ensureHealthLoaded, flushHealthNow, healthMapSnapshot, recordProxyFailure, recordProxySuccess, resetHealth, sanitizeRacingConfig } from "../racing.ts";
 import { getMetrics, renderPrometheus } from "../metrics.ts";
 import { getPromptDiagnostics, clearPromptDiagnostics } from "../promptpolicy.ts";
 import { runHealthSweep, LAST_SWEEP_KEY } from "../cron.ts";
+import { sanitizeConfig } from "../config.ts";
 
 function maskKey(k: string): string {
   if (!k) return "";
@@ -94,7 +95,9 @@ export async function handleAdmin(
     }
     // 竞速参数白名单清洗（钳位防溢出）
     if (body.racing !== undefined) next.racing = sanitizeRacingConfig(body.racing);
-    const normalized = { ...next, proxies: next.proxies };
+    // v1.8.0：整体过一遍 sanitizeConfig 再落盘 —— 此前 POST body 里的未知字段会原样写进 KV
+    // （读取时虽会被剥离，但 KV 会堆积脏数据），且手工构造的畸形值（如 max_n 超界）落盘后才被矫正
+    const normalized = sanitizeConfig({ ...next, proxies: next.proxies });
     await saveConfig(envVars, normalized);
     // v1.6.0：saveConfig 已同步刷新本 isolate 缓存，无需再 invalidate（旧代码会把刚写入的缓存清掉，
     // 导致下个请求多读一次 KV）；其他 isolate 最多滞后 60s TTL。
@@ -108,10 +111,12 @@ export async function handleAdmin(
   // ---- 订阅刷新 ----
   if (req.method === "POST" && (path === "/admin/proxies/refresh" || path === "/admin/proxies/refresh/")) {
     if (!cfg.subscription) return json({ error: "未配置 subscription 订阅地址" }, 400);
-    await envVars.VPROXY_KV.delete("proxy_cache");
+    // v1.8.0：不再先删 proxy_cache —— 旧实现「先删后拉」，拉取失败时旧缓存已被清掉、
+    // 代理池退回纯静态列表（可用性回退）。refreshSubscription 成功时会整体覆盖 KV，
+    // 失败时保留旧缓存即可，删除步骤毫无收益。
     const { refreshSubscription } = await import("../proxy/proxyfetch.ts");
     const result = await refreshSubscription(envVars, cfg.subscription);
-    if (!result) return json({ error: "订阅拉取失败（网络错误或返回非 200），旧缓存已清除" }, 502);
+    if (!result) return json({ error: "订阅拉取失败（网络错误或返回非 200），旧缓存已保留待用" }, 502);
     return json({ ok: true, proxies: result.proxies.length, skipped_unsupported: result.skipped });
   }
 
@@ -124,6 +129,9 @@ export async function handleAdmin(
       return json({ error: "Invalid JSON body" }, 400);
     }
     if (!body.proxy) return json({ error: "proxy 字段必填" }, 400);
+    // v1.8.0：先 ensureHealthLoaded —— 冷启动 isolate 直接测速会以「仅含本节点」的内存表
+    // flush 覆盖 KV，其余节点的历史健康度（胜出记忆/冷却/延迟 EMA）全部丢失
+    await ensureHealthLoaded(envVars);
     const { testProxy } = await import("../proxy/proxyfetch.ts");
     const r = await testProxy(body.proxy);
     if (r.ok) recordProxySuccess(body.proxy, r.latency_ms);
@@ -136,6 +144,8 @@ export async function handleAdmin(
   if (req.method === "POST" && (path === "/admin/proxies/test-all" || path === "/admin/proxies/test-all/")) {
     const { resolveProxyPool } = await import("../proxy/proxyfetch.ts");
     const { testAllProxies } = await import("../proxy/racefetch.ts");
+    // v1.8.0：同样先 ensureHealthLoaded（理由同单节点测试：防 KV 健康快照被部分覆盖丢失）
+    await ensureHealthLoaded(envVars);
     const pool = await resolveProxyPool(envVars, cfg, waitUntil);
     if (pool.size === 0) return json({ error: "代理池为空：请先在配置页添加代理或配置订阅" }, 400);
     const results = await testAllProxies(pool, 6);
@@ -150,6 +160,8 @@ export async function handleAdmin(
 
   // ---- 节点健康度 ----
   if (req.method === "GET" && (path === "/admin/health" || path === "/admin/health/")) {
+    // v1.8.0：先从 KV 恢复快照 —— 冷启动 isolate 直接读内存会得到空表，面板显示「暂无数据」
+    await ensureHealthLoaded(envVars);
     const now = Date.now();
     const sticky = [...healthMapSnapshot().entries()].filter(([, h]) => h.sticky).map(([uri]) => uri);
     return json({
