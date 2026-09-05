@@ -328,3 +328,89 @@ export async function* geminiSseToAnthropicEvents(
   });
   yield ev("message_stop", { type: "message_stop" });
 }
+
+/**
+ * 假流式 / 聚合（Anthropic 形态，移植自 streamMessages 的 aggregate 分支）：
+ * 完整 GResponse → 合成 Anthropic SSE 事件序列。与原项目一致，整段文本作为
+ * 单个 text_delta 一次吐出（不做 ≤8 块切分——那是 OpenAI/Gemini 端点的行为）：
+ *   message_start → (text 块 start+delta+stop)? → (tool_use 块 start+delta+stop)*
+ *   → message_delta(stop_reason + usage) → message_stop
+ */
+export async function* fakeStreamAnthropicEvents(
+  g: GResponse,
+  model: string,
+  id: string,
+  onUsage?: (inputTokens: number, outputTokens: number) => void,
+): AsyncGenerator<string> {
+  const ev = (name: string, data: unknown): string => "event: " + name + "\ndata: " + JSON.stringify(data) + "\n\n";
+
+  yield ev("message_start", {
+    type: "message_start",
+    message: {
+      id,
+      type: "message",
+      role: "assistant",
+      model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  });
+
+  // 与 geminiToAnthropic 相同的合并策略：所有 text part 合并为一个文本块
+  const cand = g.candidates?.[0];
+  const parts = cand?.content?.parts ?? [];
+  let text = "";
+  const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  for (const p of parts) {
+    const t = partText(p);
+    if (t) {
+      text += t;
+      continue;
+    }
+    const fc = partFunctionCall(p);
+    if (fc) toolCalls.push({ name: fc.name, args: fc.args ?? {} });
+  }
+
+  let blockIndex = -1;
+  if (text) {
+    blockIndex += 1;
+    yield ev("content_block_start", {
+      type: "content_block_start",
+      index: blockIndex,
+      content_block: { type: "text", text: "" },
+    });
+    yield ev("content_block_delta", {
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "text_delta", text },
+    });
+    yield ev("content_block_stop", { type: "content_block_stop", index: blockIndex });
+  }
+  const sawToolUse = toolCalls.length > 0;
+  for (const tc of toolCalls) {
+    blockIndex += 1;
+    yield ev("content_block_start", {
+      type: "content_block_start",
+      index: blockIndex,
+      content_block: { type: "tool_use", id: randomId("toolu_"), name: tc.name, input: {} },
+    });
+    yield ev("content_block_delta", {
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(tc.args) },
+    });
+    yield ev("content_block_stop", { type: "content_block_stop", index: blockIndex });
+  }
+
+  const u = g.usageMetadata ?? {};
+  const output = (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0);
+  onUsage?.(u.promptTokenCount ?? 0, output);
+  yield ev("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: mapStopReason(cand?.finishReason, sawToolUse), stop_sequence: null },
+    usage: { output_tokens: output, input_tokens: u.promptTokenCount ?? 0 },
+  });
+  yield ev("message_stop", { type: "message_stop" });
+}

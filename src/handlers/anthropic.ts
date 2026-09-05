@@ -2,6 +2,7 @@
 import { errAnthropic, json, randomId } from "../convert/common.ts";
 import {
   anthropicToGemini,
+  fakeStreamAnthropicEvents,
   geminiSseToAnthropicEvents,
   geminiToAnthropic,
 } from "../convert/anthropic.ts";
@@ -42,7 +43,10 @@ export async function handleAnthropicMessages(req: Request, ctx: HandlerCtx): Pr
     return errAnthropic(400, "invalid_request_error", "convert request failed: " + (e instanceof Error ? e.message : String(e)));
   }
 
-  const action = areq.stream ? "streamGenerateContent" : "generateContent";
+  // 假流式：请求带 fake- 前缀 / aggregate_stream 开启 → 上游非流式 + 合成流式事件序列
+  // （仅影响流式请求；与原项目 streamMessages 的 aggregate 参数语义一致）
+  const fake = resolved.fake || ctx.cfg.aggregate_stream;
+  const action = areq.stream && !fake ? "streamGenerateContent" : "generateContent";
   let upstream: Response;
   try {
     upstream = await callGemini(ctx, resolved.model, action, JSON.stringify(greq));
@@ -66,17 +70,31 @@ export async function handleAnthropicMessages(req: Request, ctx: HandlerCtx): Pr
     return json(out);
   }
 
-  // ---- 流式 ----
-  if (!upstream.body) return errAnthropic(503, "api_error", "empty upstream stream");
+  // ---- 流式 / 假流式（能走到这里必然 areq.stream=true，非流式已在上方分支返回）----
   let usage: { input: number; output: number } | null = null;
-  const gen = geminiSseToAnthropicEvents(
-    geminiJsonChunks(upstream.body),
-    areq.model,
-    id,
-    (input, output) => {
+  let gen: AsyncGenerator<string>;
+  if (fake) {
+    // 假流式：完整响应 → 单帧合成 Anthropic 事件序列（整段文本单 delta，对齐原项目）
+    let g;
+    try {
+      g = (await upstream.json()) as Parameters<typeof geminiToAnthropic>[0];
+    } catch (e) {
+      return errAnthropic(503, "api_error", "invalid upstream response: " + (e instanceof Error ? e.message : String(e)));
+    }
+    gen = fakeStreamAnthropicEvents(g, areq.model, id, (input, output) => {
       usage = { input, output };
-    },
-  );
+    });
+  } else {
+    if (!upstream.body) return errAnthropic(503, "api_error", "empty upstream stream");
+    gen = geminiSseToAnthropicEvents(
+      geminiJsonChunks(upstream.body),
+      areq.model,
+      id,
+      (input, output) => {
+        usage = { input, output };
+      },
+    );
+  }
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({

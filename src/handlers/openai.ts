@@ -14,7 +14,7 @@ import { recordUsage, scheduleFlush } from "../usage.ts";
 import { geminiJsonChunks, sseResponseFromGenerator, SSE_HEADERS } from "./sse.ts";
 import { listChatModels } from "../modellist.ts";
 import { adaptPrefill, PrefillEchoFilter } from "../prefill.ts";
-import { splitFakeChunks } from "../fakestream.ts";
+import { splitFakeChunks, withFakeVariants } from "../fakestream.ts";
 import type { OFunctionDef } from "../types.ts";
 
 /** geminiToOpenAI 输出的窄类型（其返回值为 Record<string, unknown>，这里仅做结构断言） */
@@ -299,9 +299,10 @@ function geminiUsageOf(g: GResponse): OpenAIUsage | null {
 
 export function handleOpenAIModels(): Response {
   const now = Math.floor(Date.now() / 1000);
+  // 与原项目 ModelsWithFakeVariants 一致：每个 chat 模型暴露 m / 假流式-m / fake-m 三个条目
   return json({
     object: "list",
-    data: listChatModels().map((m) => ({ id: m, object: "model", created: now, owned_by: "google" })),
+    data: withFakeVariants(listChatModels()).map((m) => ({ id: m, object: "model", created: now, owned_by: "google" })),
   });
 }
 

@@ -1,5 +1,5 @@
 // Gemini 原生协议处理器：
-//   GET  /v1beta/models                        → 当前生效模型表（内置或官方动态拉取，带官方元数据）
+//   GET  /v1beta/models                        → 当前生效模型表（内置或官方动态拉取，带官方元数据，含假流式变体）
 //   POST /v1beta/models/{model}:generateContent|streamGenerateContent|countTokens|predict|predictLongRunning
 // 请求体原样透传（不解析、不改写），仅注入 x-goog-api-key 并经代理池出站。
 import { errGemini, json } from "../convert/common.ts";
@@ -7,6 +7,8 @@ import { activeTable, isKnownModelActive } from "../modellist.ts";
 import { callGemini, resolveModel, type HandlerCtx } from "../upstream.ts";
 import { recordUsage, scheduleFlush } from "../usage.ts";
 import { passthroughResponse } from "./sse.ts";
+import { geminiFakeStreamSseBody, stripOneFakePrefix, withFakeVariants } from "../fakestream.ts";
+import type { GResponse } from "../types.ts";
 
 const ALLOWED_ACTIONS = new Set(["generateContent", "streamGenerateContent", "countTokens", "predict", "predictLongRunning"]);
 
@@ -32,11 +34,46 @@ export async function handleGeminiNative(
   }
 
   const bodyText = await req.text();
+  // 假流式：与原项目一致，Gemini 原生端点仅认 fake-/假流式- 前缀（不认 aggregate_stream），
+  // 且仅作用于 :streamGenerateContent —— 上游改走非流式 generateContent，完整拿到响应后合成 SSE 帧
+  const fake = resolved.fake && action === "streamGenerateContent";
   let upstream: Response;
   try {
-    upstream = await callGemini(ctx, resolved.model, action, bodyText);
+    upstream = await callGemini(ctx, resolved.model, fake ? "generateContent" : action, bodyText);
   } catch (e) {
     return errGemini(503, "upstream request failed: " + (e instanceof Error ? e.message : String(e)), "UNAVAILABLE");
+  }
+
+  if (fake) {
+    if (!upstream.ok) {
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+      });
+    }
+    let g: GResponse;
+    try {
+      g = (await upstream.json()) as GResponse;
+    } catch (e) {
+      return errGemini(503, "invalid upstream response: " + (e instanceof Error ? e.message : String(e)), "UNAVAILABLE");
+    }
+    const u = g.usageMetadata;
+    recordUsage(
+      ctx.clientKey,
+      resolved.model,
+      u?.promptTokenCount ?? 0,
+      (u?.candidatesTokenCount ?? 0) + (u?.thoughtsTokenCount ?? 0),
+    );
+    ctx.waitUntil(scheduleFlush(ctx.env));
+    return new Response(geminiFakeStreamSseBody(g), {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+      },
+    });
   }
 
   recordUsage(ctx.clientKey, resolved.model, 0, 0);
@@ -71,15 +108,18 @@ export async function handleGeminiNative(
   });
 }
 
-/** Gemini 模型列表：当前生效表（内置或官方动态拉取），带官方元数据 */
+/** Gemini 模型列表：当前生效表（内置或官方动态拉取）+ 假流式变体。
+ *  与原项目 ModelsWithFakeVariants 一致：仅 chat 模型展开 m / 假流式-m / fake-m 三条目；
+ *  原生专用模型（veo 等 predict-only）不展开变体但保留在列表中。 */
 export function handleGeminiListModels(): Response {
   const t = activeTable();
   return json({
-    models: [...t.chat, ...t.native_only].map((name) => {
-      const m = t.meta.get(name);
+    models: [...withFakeVariants(t.chat), ...t.native_only].map((variant) => {
+      const base = stripOneFakePrefix(variant);
+      const m = t.meta.get(base);
       return {
-        name: "models/" + name,
-        displayName: m?.display_name ?? name,
+        name: "models/" + variant,
+        displayName: m?.display_name ?? base,
         description: m?.description,
         inputTokenLimit: m?.input_token_limit,
         outputTokenLimit: m?.output_token_limit,

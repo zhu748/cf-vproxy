@@ -29,7 +29,7 @@ import { runScheduledTasks } from "./cron.ts";
 import { maskClientKey, protocolOf, pushLog } from "./logs.ts";
 import type { HandlerCtx } from "./upstream.ts";
 
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -66,6 +66,7 @@ function serviceInfo(): Response {
     panel: "/admin",
     features: [
       "openai/anthropic/gemini 三协议转换",
+      "假流式：fake-/假流式- 前缀全端点生效 + aggregate_stream（原项目 fakestream 移植）",
       "socks4/4a/socks5/http 出站代理",
       "对冲竞速（原项目 race engine 移植）",
       "节点健康度 + 粘性优选 + 节点内重试",
@@ -75,6 +76,7 @@ function serviceInfo(): Response {
       "请求指标（JSON / Prometheus）+ Claude 提示词诊断",
       "订阅拉取 + 不支持协议自动剔除",
       "官方 ListModels 拉取模型表（内置 + 面板一键重新拉取）",
+      "模型列表暴露假流式变体（m / 假流式-m / fake-m，原项目 ModelsWithFakeVariants）",
       "KV 配置热更新",
       "用量/请求日志持久化",
     ],

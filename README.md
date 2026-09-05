@@ -4,6 +4,12 @@
 > 专为 Cloudflare Workers（免费计划即可）设计。转换层逻辑与原项目对齐，去掉了 reCAPTCHA 突破、
 > TLS 指纹伪装、mihomo 代理内核等 Workers 沙箱无法实现的部分。
 >
+> **v1.5.0 更新（假流式全端点对齐）**：补齐原项目假流式（fake stream）在 Gemini 原生与 Anthropic 端点的移植——
+> `fake-` / `假流式-` 前缀现在在 **OpenAI chat / OpenAI responses / Anthropic / Gemini 原生** 四类端点全部生效；
+> `/v1/models` 与 `/v1beta/models` 参照原项目 `ModelsWithFakeVariants` 暴露变体（每个 chat 模型展开为
+> `m` / `假流式-m` / `fake-m` 三条目，便于客户端自动发现）；Gemini 原生端点帧序列严格对齐原项目
+> `geminiFakeStreamFrames`（逐 part 切块、finishReason/元数据收尾、usage 收尾帧）。
+>
 > **v1.4.0 更新（官方模型表）**：内置模型表改为 **官方 ListModels API 实拉数据**（54 个模型，含 gemini-3.8-flash /
 > gemini-3.5 系列 / gemma-4 / veo-3.1 / lyria-3 / deep-research 等），并在面板「模型」页提供
 > **「从官方重新拉取」** 一键更新（用当前上游 Key 调官方 `GET /v1beta/models?pageSize=1000`，
@@ -44,6 +50,7 @@ generativelanguage.googleapis.com  （Gemini 官方 API，你的单个 API Key�
 | Gemini 原生 | `POST /v1beta/models/{model}:generateContent / :streamGenerateContent?alt=sse / :countTokens / :predict / :predictLongRunning`（请求体透传）、`GET /v1beta/models`（当前生效模型表，带官方元数据） |
 | 对话能力 | 纯文本、图片输入（base64 / URL / data URI）、工具调用（function calling 双向转换，含流式增量）、**n 多候选**（非流式 `n>1` 并发 n 次上游请求合并 choices，受 max_n 上限保护） |
 | **官方模型表** | **v1.4.0**：内置表为官方 ListModels 实拉数据（构建时生成，含 54 个模型的官方元数据）；运行时在面板「模型」页一键 **从官方重新拉取**（用当前上游 Key 调官方接口，自动分页、代理适配，KV 持久化立即生效），可一键恢复内置表；`/v1/models`、`/v1beta/models`、模型校验均动态跟随 |
+| **假流式** | **v1.5.0 全端点**：模型名前缀 `fake-` / `假流式-`（别名目标同样生效）→ 上游非流式请求 + 合成流式输出（OpenAI/Responses/Gemini 按码点切 ≤8 块，Anthropic 整段单 delta，与原项目逐端点对齐）；`aggregate_stream=true` 时 OpenAI/Anthropic/Responses 端点全部聚合（Gemini 原生仅认前缀，同原项目）；模型列表自动暴露三变体 |
 | **Web 管理面板** | **浏览器打开 `/admin` 即可管理一切**：仪表盘（含请求指标）、配置（含镜像基地址/max_n）、代理（增删/测试/服务端并发测速）、**竞速（配置/健康表/全量测速/定时巡检）**、用量统计、模型表、请求日志。深色主题，token 登录，无需 curl |
 | **并发竞速** | **移植原项目 race engine**：每请求按健康分选出多个候选节点，首个立即发出、每隔对冲延迟追加下一个（首胜即停，败者立即中止）；429 → 30s 冷却；连接/握手/5xx → 指数冷却 + 极速接力；胜出节点粘性优选；节点内重试（网络/5xx 同节点立即重试一次）。健康度 KV 持久化（冷启动不丢） |
 | **Cron 定时任务** | **移植原项目定时健康巡检 + keepalive**：wrangler.jsonc 预置每 15 分钟一跳的 cron；实际节奏由配置控制（巡检间隔/批量/并发/超时，keepalive 间隔 5~86400s，首次立即发送），与 cron 表达式解耦；巡检结果计入健康度，订阅在每次触发时差异更新 |
@@ -331,6 +338,39 @@ curl -X POST "$BASE/admin/models/reset" -H "Authorization: Bearer $TOKEN"
 也可在本地重建内置表：`GEMINI_API_KEY=xx node scripts/gen-models.mjs`。不在表中的模型名返回 404 并提示，
 确有其它名称需求时用 `model_aliases` 映射。
 
+> 📌 两个模型列表端点均会为每个 chat 模型暴露 **假流式变体**（`m` / `假流式-m` / `fake-m`，与原项目一致），
+> 客户端从列表即可自动发现；veo 等原生专用模型不展开变体。
+
+### 假流式（fake- / 假流式- 前缀）
+
+部分客户端强制要求流式接口，但某些模型/网关非流式更稳。在模型名前加 `fake-` 或 `假流式-`
+（例如 `fake-gemini-3.7-flash`），代理会改走非流式上游请求，拿到完整回复后模拟流式吐给客户端：
+
+- **OpenAI chat / responses / Gemini 原生**：文本按码点边界切成 ≤8 块连续吐出（不切断 emoji/组合字符，无人为延迟）；
+  工具调用、finish_reason、usage 均完整保留（Gemini 帧序列逐 part 切块 + usage 收尾帧，对齐原项目 `geminiFakeStreamFrames`）；
+- **Anthropic**：整段文本作为单个 `text_delta` 输出（对齐原项目聚合语义），事件序列完整
+  （message_start → content_block_* → message_delta → message_stop）；
+- 前缀对**别名目标**同样生效（`fake-<别名>`、`<别名>`→`fake-目标` 均可，见 `model_aliases`）；
+- 思考强度归一化同样识别 fake 变体（`fake-gemini-3.7-flash` + effort=high → HIGH），与原项目一致；
+- `aggregate_stream=true`：所有请求无需前缀同样聚合（OpenAI/Anthropic/Responses；Gemini 原生仅认前缀）。
+
+```bash
+# OpenAI：假流式请求（上游非流式，客户端拿到标准流式响应）
+curl "$BASE/v1/chat/completions" \
+  -H "Authorization: Bearer mykey123" -H "Content-Type: application/json" \
+  -d '{"model":"fake-gemini-3.7-flash","messages":[{"role":"user","content":"你好"}],"stream":true}'
+
+# Gemini 原生：假流式（?alt=sse 返回合成 SSE 帧）
+curl "$BASE/v1beta/models/fake-gemini-3.7-flash:streamGenerateContent?alt=sse&key=mykey123" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
+
+# Anthropic：假流式 / 聚合
+curl "$BASE/v1/messages" \
+  -H "x-api-key: mykey123" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
+  -d '{"model":"假流式-gemini-3.7-flash","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"你好"}]}'
+```
+
 ## 七、注意事项与已知限制
 
 1. **CPU 限额**：免费计划 10ms CPU/请求。普通对话/流式转换占用极低；若频繁超限（503），升级 $5/月（30s CPU）。
@@ -346,7 +386,7 @@ curl -X POST "$BASE/admin/models/reset" -H "Authorization: Bearer $TOKEN"
 ```bash
 npm install
 npm run typecheck          # tsc --noEmit
-npm test                   # 88 个单元测试（协议帧/SOCKS4/代理清洗/字节流/转换层/配置兼容/竞速与健康度/n 多候选/metrics/cron 判定/官方模型表动态分类与 KV 往返）
+npm test                   # 102 个单元测试（协议帧/SOCKS4/代理清洗/字节流/转换层/配置兼容/竞速与健康度/n 多候选/metrics/cron 判定/官方模型表动态分类与 KV 往返/假流式全端点帧序列）
 npm run dev                # wrangler 本地 dev（代理隧道需真实出网，建议 deploy 后实测）
 ```
 
