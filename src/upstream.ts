@@ -2,11 +2,12 @@
 import type { VProxyConfig } from "./types.ts";
 import type { GGenerationConfig } from "./types.ts";
 import { pickGeminiKey } from "./config.ts";
-import { isChatModel, isKnownModel } from "./models.ts";
 import { dispatchUpstream, type ProxyPool } from "./proxy/racefetch.ts";
 import { errOpenAI, json } from "./convert/common.ts";
-import { hasFakePrefix, stripOneFakePrefix } from "./fakestream.ts";
 import { isGemini36OrLater, normalizeThinkingConfig } from "./thinking.ts";
+
+// 模型解析已抽离为纯逻辑模块（Node 可单测）；此处 re-export 保持兼容
+export { resolveModel, type ModelResolution } from "./modelresolve.ts";
 
 export interface HandlerCtx {
   env: {
@@ -28,46 +29,6 @@ export const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 /** 上游基地址（原项目 gemini_api_base_url 语义）：配置了镜像/中转则用之，否则官方地址 */
 export function geminiBase(cfg: VProxyConfig): string {
   return cfg.gemini_base_url || GEMINI_BASE;
-}
-
-export interface ModelResolution {
-  ok: boolean;
-  model: string;
-  /** 客户端看到的原始名称（含 fake- 前缀与别名，用于响应回显） */
-  display?: string;
-  /** 假流式：fake-/假流式- 前缀或 aggregate_stream 配置生效 */
-  fake?: boolean;
-  status?: number;
-  message?: string;
-}
-
-/**
- * 请求模型解析（对齐原项目 resolveRequestedModel）：
- *   剥 fake 前缀 → 别名解析 → 再剥一次 fake 前缀 → 内置表校验。
- * 支持三种写法：fake-gemini-3.6-flash、fake-<别名>、<别名>→fake-目标。
- */
-export function resolveModel(cfg: VProxyConfig, requested: string, chatOnly: boolean): ModelResolution {
-  const fakeRequested = hasFakePrefix(requested);
-  let name = stripOneFakePrefix(requested);
-  const alias = cfg.model_aliases[name] ?? name;
-  name = hasFakePrefix(alias) ? stripOneFakePrefix(alias) : alias;
-  if (cfg.disabled_models.includes(name) || cfg.disabled_models.includes(alias)) {
-    return { ok: false, model: name, display: requested, status: 403, message: "模型 " + name + " 已被管理员禁用" };
-  }
-  const known = chatOnly ? isChatModel(name) : isKnownModel(name);
-  if (!known) {
-    return {
-      ok: false,
-      model: name,
-      display: requested,
-      status: 404,
-      message:
-        "模型 " +
-        name +
-        " 不在内置模型表中。可用模型见 GET /v1/models；如需映射其它名称，请通过 /admin/config 配置 model_aliases。",
-    };
-  }
-  return { ok: true, model: name, display: requested, fake: fakeRequested || hasFakePrefix(alias) };
 }
 
 /**

@@ -4,7 +4,9 @@
 //   POST /admin/config            覆盖保存配置（含代理链接自动清洗报告、打码 Key 保护）
 //   POST /admin/proxies/refresh   强制刷新订阅
 //   POST /admin/proxy/test        测试单个代理连通性 { proxy: "socks5://..." }
-//   GET  /admin/models            内置模型表（面板用）
+//   GET  /admin/models            当前模型表（含来源/元数据）
+//   POST /admin/models/refresh    从官方 ListModels 重新拉取模型列表（KV 持久化，立即生效）
+//   POST /admin/models/reset      恢复内置模型表
 //   GET  /admin/usage             查询用量统计（KV 持久化，含聚合 totals）
 //   POST /admin/usage/reset       清空用量统计
 //   GET  /admin/logs              最近请求日志（内存环形缓冲）
@@ -15,7 +17,8 @@
 import { invalidateConfigCache, loadConfig, saveConfig, type Env } from "../config.ts";
 import { json } from "../convert/common.ts";
 import { cleanProxyList } from "../proxy/frames.ts";
-import { ALL_MODELS, GEMINI_CHAT_MODELS, GEMINI_NATIVE_ONLY_MODELS } from "../models.ts";
+import { activeSourceInfo, activeTable, builtinTable, classifyModels, clearDynamicModels, storeDynamicModels } from "../modellist.ts";
+import { geminiBase } from "../upstream.ts";
 import { clearLogs, listLogs } from "../logs.ts";
 import { renderPanelHtml } from "./panel.ts";
 import type { VProxyConfig } from "../types.ts";
@@ -205,15 +208,57 @@ export async function handleAdmin(
     return json({ ok: true });
   }
 
-  // ---- 内置模型表 ----
+  // ---- 模型表（当前生效：内置 / 官方动态拉取） ----
   if (req.method === "GET" && (path === "/admin/models" || path === "/admin/models/")) {
+    const info = activeSourceInfo();
+    const t = activeTable();
+    const b = builtinTable();
     return json({
-      chat_models: GEMINI_CHAT_MODELS,
-      native_only_models: GEMINI_NATIVE_ONLY_MODELS,
-      total: ALL_MODELS.length,
+      source: info.source,
+      fetched_at: info.fetched_at ?? null,
+      builtin_fetched_at: b.fetched_at ?? null,
+      chat_models: t.chat,
+      native_only_models: t.native_only,
+      excluded_models: t.excluded,
+      total: info.total,
       aliases: cfg.model_aliases,
       disabled: cfg.disabled_models,
+      meta: Object.fromEntries(t.meta),
     });
+  }
+
+  // ---- 从官方重新拉取模型列表（单 Key 官方 ListModels 方式，代理池可用时经代理出站） ----
+  if (req.method === "POST" && (path === "/admin/models/refresh" || path === "/admin/models/refresh/")) {
+    if (!cfg.gemini_key) return json({ error: "未配置上游 Gemini Key（面板配置页填写后再拉取）" }, 400);
+    const { resolveProxyPool } = await import("../proxy/proxyfetch.ts");
+    const { fetchOfficialModels } = await import("../proxy/modelfetch.ts");
+    const pool = await resolveProxyPool(envVars, cfg, waitUntil);
+    try {
+      const r = await fetchOfficialModels(geminiBase(cfg), cfg.gemini_key, pool, envVars, waitUntil);
+      const cls = classifyModels(r.models);
+      const usable = cls.chat.length + cls.native_only.length;
+      if (usable === 0) return json({ error: "官方返回 0 个可用模型（检查 Key 是否有效/是否受限地区）" }, 502);
+      await storeDynamicModels(envVars, r.models, r.fetched_at);
+      return json({
+        ok: true,
+        total: usable,
+        chat: cls.chat.length,
+        native_only: cls.native_only.length,
+        excluded: cls.excluded.length,
+        pages: r.pages,
+        via: r.via,
+        fetched_at: r.fetched_at,
+      });
+    } catch (e) {
+      return json({ error: e instanceof Error ? e.message : String(e) }, 502);
+    }
+  }
+
+  // ---- 恢复内置模型表（删除 KV 动态表） ----
+  if (req.method === "POST" && (path === "/admin/models/reset" || path === "/admin/models/reset/")) {
+    await clearDynamicModels(envVars);
+    const b = builtinTable();
+    return json({ ok: true, source: "builtin", total: b.chat.length + b.native_only.length });
   }
 
   // ---- 用量统计 ----

@@ -8,8 +8,8 @@
 //   POST /v1/chat/completions                       OpenAI Chat Completions（流式/非流式）
 //   POST /v1/messages                               Anthropic Messages（流式/非流式）
 //   POST /v1/messages/count_tokens                  Anthropic Token 计数
-//   GET  /v1beta/models                             Gemini 模型列表
-//   POST /v1beta/models/{model}:{action}            Gemini 原生透传
+//   GET  /v1beta/models                             Gemini 模型列表（当前生效表，带官方元数据）
+//   POST /v1beta/models/{model}:{action}            Gemini 原生透传（generateContent/stream/countTokens/predict/predictLongRunning）
 //   /admin/*                                        管理端点（ADMIN_TOKEN）
 //
 // 鉴权：客户端携带的 Key（Bearer / x-api-key / x-goog-api-key / ?key=）必须命中
@@ -22,13 +22,14 @@ import { errOpenAI, json } from "./convert/common.ts";
 import type { Env } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { resolveProxyPool } from "./proxy/proxyfetch.ts";
+import { loadActiveModels } from "./modellist.ts";
 import { flushIfDue } from "./usage.ts";
 import { flushMetricsIfDue, metricsBegin, metricsFinish } from "./metrics.ts";
 import { runScheduledTasks } from "./cron.ts";
 import { maskClientKey, protocolOf, pushLog } from "./logs.ts";
 import type { HandlerCtx } from "./upstream.ts";
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -73,17 +74,20 @@ function serviceInfo(): Response {
       "上游镜像/中转基地址（gemini_base_url）",
       "请求指标（JSON / Prometheus）+ Claude 提示词诊断",
       "订阅拉取 + 不支持协议自动剔除",
+      "官方 ListModels 拉取模型表（内置 + 面板一键重新拉取）",
       "KV 配置热更新",
       "用量/请求日志持久化",
     ],
     endpoints: {
       openai: ["GET /v1/models", "POST /v1/chat/completions"],
       anthropic: ["POST /v1/messages", "POST /v1/messages/count_tokens"],
-      gemini: ["GET /v1beta/models", "POST /v1beta/models/{model}:{generateContent|streamGenerateContent|countTokens|predict}"],
+      gemini: ["GET /v1beta/models", "POST /v1beta/models/{model}:{generateContent|streamGenerateContent|countTokens|predict|predictLongRunning}"],
       admin: [
         "GET /admin (Web 面板)",
         "GET|POST /admin/config",
         "GET /admin/models",
+        "POST /admin/models/refresh (从官方重新拉取模型表)",
+        "POST /admin/models/reset (恢复内置表)",
         "GET /admin/usage",
         "POST /admin/usage/reset",
         "GET /admin/logs",
@@ -182,6 +186,8 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
   }
 
   const pool = await resolveProxyPool(env, cfg, (p) => ctx.waitUntil(p));
+  // 模型表：KV 动态表（官方拉取）优先，否则内置表（60s 内存缓存，KV 读失败回退内置）
+  await loadActiveModels(env);
   const hctx: HandlerCtx = {
     env,
     cfg,

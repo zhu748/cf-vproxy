@@ -12,7 +12,7 @@ import type { GResponse, GRequest, ORequest } from "../types.ts";
 import { callGemini, finalizeGenerationConfig, mapUpstreamError, resolveModel, type HandlerCtx } from "../upstream.ts";
 import { recordUsage, scheduleFlush } from "../usage.ts";
 import { geminiJsonChunks, sseResponseFromGenerator, SSE_HEADERS } from "./sse.ts";
-import { GEMINI_CHAT_MODELS } from "../models.ts";
+import { listChatModels } from "../modellist.ts";
 import { adaptPrefill, PrefillEchoFilter } from "../prefill.ts";
 import { splitFakeChunks } from "../fakestream.ts";
 import type { OFunctionDef } from "../types.ts";
@@ -301,7 +301,7 @@ export function handleOpenAIModels(): Response {
   const now = Math.floor(Date.now() / 1000);
   return json({
     object: "list",
-    data: GEMINI_CHAT_MODELS.map((m) => ({ id: m, object: "model", created: now, owned_by: "google" })),
+    data: listChatModels().map((m) => ({ id: m, object: "model", created: now, owned_by: "google" })),
   });
 }
 

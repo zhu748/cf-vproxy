@@ -355,12 +355,26 @@ const PANEL_HTML = `
 <!-- ===== 模型 ===== -->
 <section class="view" id="v-models">
   <div class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:12px">
+      <div>
+        <h3 style="margin:0">模型表 <span class="tag" id="md-source-tag">内置</span></h3>
+        <div style="color:var(--muted);font-size:12.5px;margin-top:4px" id="md-srcinfo">加载中…</div>
+      </div>
+      <div class="row">
+        <button class="btn ghost sm" id="md-refresh">从官方重新拉取</button>
+        <button class="btn ghost sm" id="md-reset">恢复内置表</button>
+      </div>
+    </div>
     <h3>Chat 模型（OpenAI / Anthropic / Gemini 三入口可用）</h3>
     <div class="model-grid" id="md-chat"></div>
   </div>
   <div class="card" style="margin-top:14px">
-    <h3>仅 Gemini 原生透传（:predict 等）</h3>
+    <h3>仅 Gemini 原生透传（:predict / :predictLongRunning）</h3>
     <div class="model-grid" id="md-native"></div>
+  </div>
+  <div class="card" style="margin-top:14px" id="md-excluded-card" hidden>
+    <h3>已排除（仅支持 embedding / 实时双向流等本代理不透传的端点）</h3>
+    <div class="model-grid" id="md-excluded"></div>
   </div>
 </section>
 
@@ -923,6 +937,7 @@ LOADERS.models = function(){
   api("/models").then(function(j){
     var aliases = j.aliases || {};
     var dis = j.disabled || [];
+    var meta = j.meta || {};
     var reverse = {};
     Object.keys(aliases).forEach(function(k){ (reverse[aliases[k]] = reverse[aliases[k]] || []).push(k); });
     function item(m){
@@ -930,11 +945,43 @@ LOADERS.models = function(){
       (reverse[m] || []).forEach(function(k){ tags += ' <span class="tag ok">' + esc(k) + ' →</span>'; });
       if (aliases[m]) tags += ' <span class="tag warn">→ ' + esc(aliases[m]) + '</span>';
       if (dis.indexOf(m) >= 0) tags += ' <span class="tag err">已禁用</span>';
-      return '<div class="model-item"><span>' + esc(m) + '</span><span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">' + tags + '</span></div>';
+      var mm = meta[m] || {};
+      var tip = mm.display_name || m;
+      if (mm.input_token_limit) tip += " · 入 " + mm.input_token_limit;
+      if (mm.output_token_limit) tip += " · 出 " + mm.output_token_limit;
+      if (mm.thinking) tip += " · thinking";
+      return '<div class="model-item" title="' + esc(tip) + '"><span>' + esc(m) + '</span><span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">' + tags + '</span></div>';
     }
     $("md-chat").innerHTML = j.chat_models.map(item).join("");
     $("md-native").innerHTML = j.native_only_models.map(item).join("");
+    var exc = j.excluded_models || [];
+    if (exc.length){ $("md-excluded-card").hidden = false; $("md-excluded").innerHTML = exc.map(item).join(""); }
+    else { $("md-excluded-card").hidden = true; }
+    $("md-source-tag").textContent = j.source === "official" ? "官方拉取" : "内置";
+    $("md-source-tag").className = "tag " + (j.source === "official" ? "ok" : "");
+    var info = "共 " + j.total + " 个可用模型";
+    if (j.fetched_at) info += " · 拉取于 " + fmtT(j.fetched_at);
+    if (j.builtin_fetched_at) info += " · 内置表基线 " + j.builtin_fetched_at;
+    $("md-srcinfo").textContent = info;
   }).catch(function(e){ if (e.message !== "NEED_LOGIN") toast("加载失败：" + e.message, "err"); });
+};
+
+$("md-refresh").onclick = function(){
+  var b = $("md-refresh");
+  if (b.disabled) return;
+  b.disabled = true; b.textContent = "拉取中…";
+  api("/models/refresh", { method: "POST" }).then(function(j){
+    toast("已拉取官方模型表：可用 " + j.total + "（chat " + j.chat + " / 原生 " + j.native_only + " / 排除 " + j.excluded + "）", "ok", 5600);
+    LOADERS.models();
+  }).catch(function(e){
+    if (e.message !== "NEED_LOGIN") toast("拉取失败：" + e.message, "err", 6400);
+  }).then(function(){ b.disabled = false; b.textContent = "从官方重新拉取"; });
+};
+
+$("md-reset").onclick = function(){
+  if (!confirm("恢复内置模型表？官方拉取的动态表将被删除。")) return;
+  api("/models/reset", { method: "POST" }).then(function(){ toast("已恢复内置模型表", "ok"); LOADERS.models(); })
+    .catch(function(e){ if (e.message !== "NEED_LOGIN") toast(e.message, "err"); });
 };
 
 // ===== 日志页 =====

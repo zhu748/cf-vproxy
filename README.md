@@ -4,6 +4,12 @@
 > 专为 Cloudflare Workers（免费计划即可）设计。转换层逻辑与原项目对齐，去掉了 reCAPTCHA 突破、
 > TLS 指纹伪装、mihomo 代理内核等 Workers 沙箱无法实现的部分。
 >
+> **v1.4.0 更新（官方模型表）**：内置模型表改为 **官方 ListModels API 实拉数据**（54 个模型，含 gemini-3.8-flash /
+> gemini-3.5 系列 / gemma-4 / veo-3.1 / lyria-3 / deep-research 等），并在面板「模型」页提供
+> **「从官方重新拉取」** 一键更新（用当前上游 Key 调官方 `GET /v1beta/models?pageSize=1000`，
+> 结果存 KV 立即生效，可随时恢复内置表）；Gemini 原生入口新增 `:predictLongRunning` 透传；
+> 模型校验、`/v1/models`、`/v1beta/models` 全部改为动态表驱动。
+>
 > **v1.3.0 更新（全功能对齐版）**：除「无头 Vertex 匿名端点」外，原项目所有可适配 CF 的功能已全部移植：
 > ① OpenAI **n 多候选**（max_n + CompleteChatN：n 次并发上游请求合并 choices）；② **上游镜像/中转基地址**（gemini_base_url）；
 > ③ **Cron Triggers 定时任务**：定时健康巡检（proxy_health_check_*）、订阅差异更新、keepalive 保活；
@@ -35,8 +41,9 @@ generativelanguage.googleapis.com  （Gemini 官方 API，你的单个 API Key�
 |------|------|
 | OpenAI 协议 | `POST /v1/chat/completions`（流式/非流式）、`GET /v1/models` |
 | Anthropic 协议 | `POST /v1/messages`（流式/非流式）、`POST /v1/messages/count_tokens` |
-| Gemini 原生 | `POST /v1beta/models/{model}:generateContent / :streamGenerateContent?alt=sse / :countTokens / :predict`（请求体透传）、`GET /v1beta/models` |
+| Gemini 原生 | `POST /v1beta/models/{model}:generateContent / :streamGenerateContent?alt=sse / :countTokens / :predict / :predictLongRunning`（请求体透传）、`GET /v1beta/models`（当前生效模型表，带官方元数据） |
 | 对话能力 | 纯文本、图片输入（base64 / URL / data URI）、工具调用（function calling 双向转换，含流式增量）、**n 多候选**（非流式 `n>1` 并发 n 次上游请求合并 choices，受 max_n 上限保护） |
+| **官方模型表** | **v1.4.0**：内置表为官方 ListModels 实拉数据（构建时生成，含 54 个模型的官方元数据）；运行时在面板「模型」页一键 **从官方重新拉取**（用当前上游 Key 调官方接口，自动分页、代理适配，KV 持久化立即生效），可一键恢复内置表；`/v1/models`、`/v1beta/models`、模型校验均动态跟随 |
 | **Web 管理面板** | **浏览器打开 `/admin` 即可管理一切**：仪表盘（含请求指标）、配置（含镜像基地址/max_n）、代理（增删/测试/服务端并发测速）、**竞速（配置/健康表/全量测速/定时巡检）**、用量统计、模型表、请求日志。深色主题，token 登录，无需 curl |
 | **并发竞速** | **移植原项目 race engine**：每请求按健康分选出多个候选节点，首个立即发出、每隔对冲延迟追加下一个（首胜即停，败者立即中止）；429 → 30s 冷却；连接/握手/5xx → 指数冷却 + 极速接力；胜出节点粘性优选；节点内重试（网络/5xx 同节点立即重试一次）。健康度 KV 持久化（冷启动不丢） |
 | **Cron 定时任务** | **移植原项目定时健康巡检 + keepalive**：wrangler.jsonc 预置每 15 分钟一跳的 cron；实际节奏由配置控制（巡检间隔/批量/并发/超时，keepalive 间隔 5~86400s，首次立即发送），与 cron 表达式解耦；巡检结果计入健康度，订阅在每次触发时差异更新 |
@@ -110,7 +117,7 @@ npx wrangler deploy
 | **配置** | 上游 Gemini Key（打码显示，原样保存即不修改）、客户端 Key 增删、订阅链接与刷新间隔、模型别名、禁用模型 |
 | **代理** | 代理列表（协议徽章 / 认证标识）、单条测试与批量测速、粘贴批量添加（**不支持的链接即时剔除并显示原因**）、订阅一键刷新 |
 | **用量** | 按 Key 统计表格，展开查看模型分布，一键清空 |
-| **模型** | 内置模型表（chat / 原生专用），别名与禁用状态标注 |
+| **模型** | 当前模型表（chat / 原生专用 / 已排除三类，含官方元数据悬浮提示），来源标识（内置 / 官方拉取时间），**一键从官方重新拉取 / 恢复内置表**，别名与禁用状态标注 |
 | **日志** | 最近 64 条请求：协议、路径、状态码、耗时、出口代理、打码 Key |
 
 token 保存在浏览器 localStorage，点「退出」即清除。
@@ -298,19 +305,31 @@ curl "$BASE/v1beta/models/gemini-3.7-flash:generateContent?key=mykey123" \
   -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
 ```
 
-### 内置模型表
+### 模型表（官方 ListModels 拉取方式）
 
-与原项目 `config/models.json` 对齐。**chat 类入口（OpenAI/Anthropic）仅接受下列 gemini 模型**：
+单 Key 模式下，模型列表直接来自 **官方 ListModels API**：`GET /v1beta/models?pageSize=1000`（`x-goog-api-key` 鉴权）。
 
+- **内置表**：部署前用官方接口实拉生成（`src/models_data.ts`，54 个模型）。分类规则：
+  - **chat**（methods 含 `generateContent`，三入口可用）：`gemini-2.5-*`、`gemini-3.*` 全系（含 flash-lite/pro/image）、`gemini-3.5/3.6/3.7/3.8-flash`、`gemma-4-*`、`gemini-flash/pro-latest`、`deep-research-*`、`gemini-2.5-*-tts`、`lyria-3*`、`gemini-omni-*` 等；
+  - **原生专用**（仅 `:predict` / `:predictLongRunning`）：`veo-3.1-*` 三款；
+  - **自动排除**（本代理不透传的端点）：仅 `embedContent`（embedding 系列）、`generateAnswer`（aqa）、`bidiGenerateContent`（实时双向流）的模型。
+- **在线更新**：新模型发布后无需重新部署 —— 面板「模型」页点 **「从官方重新拉取」**，或：
+
+```bash
+# 用当前配置的上游 Key 调官方接口重新拉取（代理池非空时自动经代理出站）
+curl -X POST "$BASE/admin/models/refresh" -H "Authorization: Bearer $TOKEN"
+# → { ok, total, chat, native_only, excluded, pages, via, fetched_at }
+
+# 查看当前生效表（含来源、拉取时间、逐模型元数据）
+curl "$BASE/admin/models" -H "Authorization: Bearer $TOKEN"
+
+# 恢复内置表（删除 KV 动态表）
+curl -X POST "$BASE/admin/models/reset" -H "Authorization: Bearer $TOKEN"
 ```
-gemini-2.5-flash-lite / gemini-2.5-flash / gemini-2.5-flash-image / gemini-2.5-pro
-gemini-3-flash-preview / gemini-3-pro-image
-gemini-3.1-flash-lite / gemini-3.1-flash-lite-image / gemini-3.1-flash-image / gemini-3.1-pro-preview
-gemini-3.5-flash-lite / gemini-3.5-flash / gemini-3.6-flash / gemini-3.7-flash / gemini-3.8-flash
-```
 
-`imagen-4.0-*`、`veo-*`、`lyria-002` 等非文本模型仅支持 Gemini 原生入口的 `:predict` 动作。
-不在表中的模型名会返回 404 并提示；确有其它模型需求时用 `model_aliases` 映射，或修改 `src/models.ts`。
+拉取结果存 KV（`models:dynamic`），`/v1/models`、`/v1beta/models`、模型校验即刻跟随；KV 读失败自动回退内置表。
+也可在本地重建内置表：`GEMINI_API_KEY=xx node scripts/gen-models.mjs`。不在表中的模型名返回 404 并提示，
+确有其它名称需求时用 `model_aliases` 映射。
 
 ## 七、注意事项与已知限制
 
@@ -327,7 +346,7 @@ gemini-3.5-flash-lite / gemini-3.5-flash / gemini-3.6-flash / gemini-3.7-flash /
 ```bash
 npm install
 npm run typecheck          # tsc --noEmit
-npm test                   # 76 个单元测试（协议帧/SOCKS4/代理清洗/字节流/转换层/配置兼容/竞速与健康度/n 多候选/metrics/cron 判定）
+npm test                   # 88 个单元测试（协议帧/SOCKS4/代理清洗/字节流/转换层/配置兼容/竞速与健康度/n 多候选/metrics/cron 判定/官方模型表动态分类与 KV 往返）
 npm run dev                # wrangler 本地 dev（代理隧道需真实出网，建议 deploy 后实测）
 ```
 
@@ -340,8 +359,11 @@ src/
   racing.ts           并发竞速纯逻辑：健康度/评分/冷却/粘性/候选选择 + KV 快照同步（可单测）
   usage.ts            用量统计（内存累积 + 25s 批量刷 KV + totals 聚合）
   logs.ts             最近请求日志（内存环形缓冲 64 条）
-  models.ts           内置模型表（对齐原项目 models.json）
-  upstream.ts         上游调用 + 模型校验 + 错误映射
+  models.ts           内置模型表分类导出（数据来自官方 ListModels 实拉，见 models_data.ts）
+  models_data.ts      内置模型表数据（官方 ListModels 生成，scripts/gen-models.mjs 可重建）
+  modellist.ts        动态模型表：分类规则 / 官方响应解析 / KV 动态表激活与回退（纯逻辑，可单测）
+  modelresolve.ts     模型解析（fake 前缀/别名/动态表校验，纯逻辑，可单测）
+  upstream.ts         上游调用 + 错误映射
   handlers/
     admin.ts          管理端点（面板路由 / 配置 / 代理 / 测速 / 健康度 / 用量 / 日志 / 模型）
     panel.ts          Web 管理面板（单文件内联 HTML/CSS/JS，无外部依赖，含竞速页）
@@ -354,6 +376,7 @@ src/
     tunnel.ts         握手编排（SOCKS4/4a 认证 + SOCKS5 认证 + HTTP CONNECT）
     proxyfetch.ts     cloudflare:sockets 出站隧道（viaProxy 支持中止 / 订阅 / 自动剔除）
     racefetch.ts      对冲竞速编排（首胜即停 / 接力 / 全量测速）+ 健康轮换顺序模式
+    modelfetch.ts     官方 ListModels 拉取编排（分页跟随，代理池适配）
 ```
 
 ## 九、致谢与许可

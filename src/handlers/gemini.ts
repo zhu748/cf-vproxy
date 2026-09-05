@@ -1,14 +1,14 @@
 // Gemini 原生协议处理器：
-//   GET  /v1beta/models                        → 内置模型表合成
-//   POST /v1beta/models/{model}:generateContent|streamGenerateContent|countTokens|predict
+//   GET  /v1beta/models                        → 当前生效模型表（内置或官方动态拉取，带官方元数据）
+//   POST /v1beta/models/{model}:generateContent|streamGenerateContent|countTokens|predict|predictLongRunning
 // 请求体原样透传（不解析、不改写），仅注入 x-goog-api-key 并经代理池出站。
 import { errGemini, json } from "../convert/common.ts";
-import { ALL_MODELS, GEMINI_NATIVE_ONLY_MODELS } from "../models.ts";
+import { activeTable, isKnownModelActive } from "../modellist.ts";
 import { callGemini, resolveModel, type HandlerCtx } from "../upstream.ts";
 import { recordUsage, scheduleFlush } from "../usage.ts";
 import { passthroughResponse } from "./sse.ts";
 
-const ALLOWED_ACTIONS = new Set(["generateContent", "streamGenerateContent", "countTokens", "predict"]);
+const ALLOWED_ACTIONS = new Set(["generateContent", "streamGenerateContent", "countTokens", "predict", "predictLongRunning"]);
 
 export async function handleGeminiNative(
   model: string,
@@ -17,13 +17,17 @@ export async function handleGeminiNative(
   ctx: HandlerCtx,
 ): Promise<Response> {
   if (!ALLOWED_ACTIONS.has(action)) {
-    return errGemini(404, "unsupported action :" + action + "（仅支持 generateContent / streamGenerateContent / countTokens / predict）", "NOT_FOUND");
+    return errGemini(
+      404,
+      "unsupported action :" + action + "（仅支持 generateContent / streamGenerateContent / countTokens / predict / predictLongRunning）",
+      "NOT_FOUND",
+    );
   }
-  // 非文本模型（imagen/veo/lyria 等）只配 predict；chat 动作走内置表校验
-  const isPredict = action === "predict";
+  // 非文本模型（veo/imagen 等）只配 predict(LongRunning)；chat 动作走 chat 表校验
+  const isPredict = action === "predict" || action === "predictLongRunning";
   const resolved = resolveModel(ctx.cfg, model, !isPredict);
   if (!resolved.ok) return errGemini(resolved.status ?? 400, resolved.message ?? "model error", resolved.status === 404 ? "NOT_FOUND" : "INVALID_ARGUMENT");
-  if (isPredict && !GEMINI_NATIVE_ONLY_MODELS.includes(resolved.model) && !ALL_MODELS.includes(resolved.model)) {
+  if (isPredict && !isKnownModelActive(resolved.model)) {
     return errGemini(404, "未知模型 " + resolved.model, "NOT_FOUND");
   }
 
@@ -67,11 +71,21 @@ export async function handleGeminiNative(
   });
 }
 
+/** Gemini 模型列表：当前生效表（内置或官方动态拉取），带官方元数据 */
 export function handleGeminiListModels(): Response {
+  const t = activeTable();
   return json({
-    models: ALL_MODELS.map((m) => ({
-      name: "models/" + m,
-      supportedGenerationMethods: GEMINI_NATIVE_ONLY_MODELS.includes(m) ? ["predict"] : ["generateContent", "streamGenerateContent", "countTokens"],
-    })),
+    models: [...t.chat, ...t.native_only].map((name) => {
+      const m = t.meta.get(name);
+      return {
+        name: "models/" + name,
+        displayName: m?.display_name ?? name,
+        description: m?.description,
+        inputTokenLimit: m?.input_token_limit,
+        outputTokenLimit: m?.output_token_limit,
+        thinking: m?.thinking,
+        supportedGenerationMethods: m?.methods ?? ["generateContent", "streamGenerateContent", "countTokens"],
+      };
+    }),
   });
 }
