@@ -1,7 +1,7 @@
 {
   "name": "cf-vproxy",
-  "version": "1.2.0",
-  "description": "Vertex Master 精简移植版 — Cloudflare Workers 上的 Gemini 官方 API 多协议代理（单 Key 直连 + SOCKS4/5/HTTP 出站代理 + 对冲竞速 + Web 管理面板）",
+  "version": "1.3.0",
+  "description": "Vertex Master 全功能移植版 — Cloudflare Workers 上的 Gemini 官方 API 多协议代理（单 Key 直连 + SOCKS4/5/HTTP 出站 + 对冲竞速 + Cron 健康巡检/keepalive + n 多候选 + 请求指标 + Web 管理面板）",
   "private": true,
   "type": "module",
   "scripts": {

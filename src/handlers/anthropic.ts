@@ -32,7 +32,12 @@ export async function handleAnthropicMessages(req: Request, ctx: HandlerCtx): Pr
 
   let greq;
   try {
-    greq = await anthropicToGemini(areq);
+    greq = await anthropicToGemini(areq, {
+      policy: ctx.cfg.claude_prompt,
+      endpoint: "generate",
+      clientModel: areq.model,
+      resolvedModel: resolved.model,
+    });
   } catch (e) {
     return errAnthropic(400, "invalid_request_error", "convert request failed: " + (e instanceof Error ? e.message : String(e)));
   }
@@ -117,7 +122,12 @@ export async function handleAnthropicCountTokens(req: Request, ctx: HandlerCtx):
   if (!resolved.ok) {
     return errAnthropic(resolved.status === 404 ? 404 : 400, "invalid_request_error", resolved.message ?? "model error");
   }
-  const greq = await anthropicToGemini(areq);
+  const greq = await anthropicToGemini(areq, {
+    policy: ctx.cfg.claude_prompt,
+    endpoint: "count_tokens",
+    clientModel: areq.model,
+    resolvedModel: resolved.model,
+  });
   let upstream: Response;
   try {
     upstream = await callGemini(ctx, resolved.model, "countTokens", JSON.stringify(greq));

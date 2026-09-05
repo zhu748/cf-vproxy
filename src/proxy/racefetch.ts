@@ -52,40 +52,99 @@ function healthyOrder(entries: ProxyPool["entries"]): ProxyPool["entries"] {
 
 let rrCursor = 0;
 
+/** 节点内单次尝试结果 */
+interface NodeAttempt {
+  resp?: Response;
+  error?: string;
+  ms: number;
+}
+
+async function attemptOnce(p: { raw: string }, url: string, init: RequestInit): Promise<NodeAttempt> {
+  const started = Date.now();
+  try {
+    const resp = await viaProxy(p as Parameters<typeof viaProxy>[0], url, init);
+    return { resp, ms: Date.now() - started };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err), ms: Date.now() - started };
+  }
+}
+
+/**
+ * 节点内重试（原项目 parallel_pool_retry_enabled）：
+ * 网络层错误或上游 5xx 时，同一节点立即重试一次（这类失败常与出口无关）。
+ * 429 不重试 —— 直接冷却该节点并接力下一个更有价值。
+ */
+async function retrySameNodeOnce(
+  p: { raw: string },
+  url: string,
+  init: RequestInit,
+  errors: string[],
+  reason: string,
+): Promise<Response | null> {
+  const second = await attemptOnce(p, url, init);
+  if (second.resp && second.resp.status < 400) {
+    recordProxySuccess(p.raw, second.ms);
+    return second.resp;
+  }
+  if (second.resp) {
+    if (second.resp.status === 429) recordProxyRateLimit(p.raw);
+    else recordProxyFailure(p.raw, "HTTP " + second.resp.status);
+    errors.push("[" + p.raw + "] retry(" + reason + ") HTTP " + second.resp.status);
+    void second.resp.body?.cancel().catch(() => {});
+  } else {
+    recordProxyFailure(p.raw, second.error ?? "retry failed");
+    errors.push("[" + p.raw + "] retry(" + reason + ") " + (second.error ?? "failed"));
+  }
+  return null;
+}
+
 /** 顺序模式：按健康分排序后轮换，最多接力 3 个，429/5xx 也接力 */
 export async function rotateUpstream(
   url: string,
   init: RequestInit,
   pool: ProxyPool,
+  nodeRetry = false,
 ): Promise<UpstreamResult> {
   const order = healthyOrder(pool.entries);
   const maxTry = Math.min(order.length, 3);
   const errors: string[] = [];
+  const retried = new Set<string>();
   const start = order.length > 0 ? rrCursor % order.length : 0;
   rrCursor = (rrCursor + 1) % Math.max(1, order.length);
   for (let i = 0; i < maxTry; i++) {
     const p = order[(start + i) % order.length];
-    const started = Date.now();
-    try {
-      const resp = await viaProxy(p, url, init);
-      if (resp.status === 429) {
-        recordProxyRateLimit(p.raw);
-        errors.push("[" + p.raw + "] 429 Rate Limit");
-        void resp.body?.cancel().catch(() => {});
-        continue;
+    const r = await attemptOnce(p, url, init);
+    if (r.resp && r.resp.status < 400) {
+      recordProxySuccess(p.raw, r.ms);
+      return { response: r.resp, via: p.raw };
+    }
+    if (r.resp && r.resp.status === 429) {
+      recordProxyRateLimit(p.raw);
+      errors.push("[" + p.raw + "] 429 Rate Limit");
+      void r.resp.body?.cancel().catch(() => {});
+      continue;
+    }
+    if (r.resp && r.resp.status >= 500) {
+      recordProxyFailure(p.raw, "HTTP " + r.resp.status);
+      errors.push("[" + p.raw + "] HTTP " + r.resp.status);
+      void r.resp.body?.cancel().catch(() => {});
+      if (nodeRetry && !retried.has(p.raw)) {
+        retried.add(p.raw);
+        const again = await retrySameNodeOnce(p, url, init, errors, "5xx");
+        if (again) return { response: again, via: p.raw };
       }
-      if (resp.status >= 500) {
-        recordProxyFailure(p.raw, "HTTP " + resp.status);
-        errors.push("[" + p.raw + "] HTTP " + resp.status);
-        void resp.body?.cancel().catch(() => {});
-        continue;
-      }
-      recordProxySuccess(p.raw, Date.now() - started);
-      return { response: resp, via: p.raw };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      recordProxyFailure(p.raw, msg);
-      errors.push("[" + p.raw + "] " + msg);
+      continue;
+    }
+    if (r.resp) {
+      // 请求级 4xx：与代理无关，直接返回（原项目语义：不惩罚节点、不接力）
+      return { response: r.resp, via: p.raw };
+    }
+    recordProxyFailure(p.raw, r.error ?? "network error");
+    errors.push("[" + p.raw + "] " + (r.error ?? "network error"));
+    if (nodeRetry && !retried.has(p.raw)) {
+      retried.add(p.raw);
+      const again = await retrySameNodeOnce(p, url, init, errors, "network");
+      if (again) return { response: again, via: p.raw };
     }
   }
   throw new Error("all proxy attempts failed: " + errors.join(" | "));
@@ -140,16 +199,30 @@ export async function raceUpstream(
   if (candidates.length <= 1) {
     // 唯一候选：直接单发（失败不接力 —— 候选表已含全部健康节点）
     if (candidates.length === 1) {
-      const started = Date.now();
-      const resp = await viaProxy(candidates[0] as Parameters<typeof viaProxy>[0], url, init);
-      const ms = Date.now() - started;
-      const kind = classifyStatus(resp.status);
-      if (kind === "ok") recordProxySuccess(candidates[0].raw, ms);
-      else if (kind === "ratelimit") recordProxyRateLimit(candidates[0].raw);
-      else if (kind === "retryable") recordProxyFailure(candidates[0].raw, "HTTP " + resp.status);
-      return { response: resp, via: candidates[0].raw };
+      const only = candidates[0] as { raw: string };
+      const r = await attemptOnce(only, url, init);
+      if (r.resp) {
+        const kind = classifyStatus(r.resp.status);
+        if (kind === "ok") recordProxySuccess(only.raw, r.ms);
+        else if (kind === "ratelimit") recordProxyRateLimit(only.raw);
+        else if (kind === "retryable") {
+          recordProxyFailure(only.raw, "HTTP " + r.resp.status);
+          // 节点内重试：5xx/网络抖动同节点立即再试一次
+          if (racing.node_retry) {
+            const again = await retrySameNodeOnce(only, url, init, [], "single-candidate");
+            if (again) return { response: again, via: only.raw };
+          }
+        }
+        return { response: r.resp, via: only.raw };
+      }
+      recordProxyFailure(only.raw, r.error ?? "network error");
+      if (racing.node_retry) {
+        const again = await retrySameNodeOnce(only, url, init, [], "single-candidate");
+        if (again) return { response: again, via: only.raw };
+      }
+      throw new Error("upstream attempt failed: " + (r.error ?? "network error"));
     }
-    return rotateUpstream(url, init, pool);
+    return rotateUpstream(url, init, pool, racing.node_retry);
   }
 
   const hedge = racing.dynamic_delay
@@ -288,7 +361,7 @@ export async function dispatchUpstream(
   }
   let result: UpstreamResult;
   if (!rc.enabled || pool.size === 1) {
-    result = await rotateUpstream(url, init, pool);
+    result = await rotateUpstream(url, init, pool, rc.node_retry);
   } else {
     result = await raceUpstream(url, init, pool, rc, waitUntil);
   }

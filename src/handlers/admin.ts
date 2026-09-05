@@ -20,6 +20,9 @@ import { clearLogs, listLogs } from "../logs.ts";
 import { renderPanelHtml } from "./panel.ts";
 import type { VProxyConfig } from "../types.ts";
 import { allHealthRecords, averageLatency, flushHealthNow, healthMapSnapshot, recordProxyFailure, recordProxySuccess, resetHealth, sanitizeRacingConfig } from "../racing.ts";
+import { getMetrics, renderPrometheus } from "../metrics.ts";
+import { getPromptDiagnostics, clearPromptDiagnostics } from "../promptpolicy.ts";
+import { runHealthSweep, LAST_SWEEP_KEY } from "../cron.ts";
 
 function maskKey(k: string): string {
   if (!k) return "";
@@ -156,6 +159,49 @@ export async function handleAdmin(
 
   if (req.method === "POST" && (path === "/admin/health/reset" || path === "/admin/health/reset/")) {
     await resetHealth(envVars);
+    return json({ ok: true });
+  }
+
+  // ---- 手动触发一轮健康巡检（与 Cron 定时巡检同一实现，见 src/cron.ts） ----
+  if (req.method === "POST" && (path === "/admin/health/sweep" || path === "/admin/health/sweep/")) {
+    const report = await runHealthSweep(envVars, cfg).catch((e: unknown) => ({
+      tested: 0,
+      ok: 0,
+      failed: 0,
+      batch_size: 0,
+      concurrency: 0,
+      timeout_seconds: 0,
+      duration_ms: 0,
+      results: [],
+      error: e instanceof Error ? e.message : String(e),
+    }));
+    await envVars.VPROXY_KV.put(LAST_SWEEP_KEY, String(Date.now())).catch(() => {});
+    return json({ ok: true, report });
+  }
+
+  // ---- 请求指标（原项目 metrics.go 语义；?format=prometheus 返回文本格式） ----
+  if (req.method === "GET" && (path === "/admin/metrics" || path === "/admin/metrics/")) {
+    const snap = await getMetrics(envVars);
+    const format = new URL(req.url).searchParams.get("format");
+    if (format === "prometheus" || format === "prom") {
+      return new Response(renderPrometheus(snap), {
+        headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+    return json({ metrics: snap, prometheus: "/admin/metrics?format=prometheus" });
+  }
+
+  // ---- Claude 提示词诊断（原项目 prompt_diagnostics 语义：最近一次生成/计数记录分开保存） ----
+  if (req.method === "GET" && (path === "/admin/prompt-diagnostics" || path === "/admin/prompt-diagnostics/")) {
+    return json({
+      generate: getPromptDiagnostics("generate"),
+      count_tokens: getPromptDiagnostics("count_tokens"),
+      _hint: "记录 isolate 内存中每个端点最近一次 Claude 请求的 system 处理结果（含推广/前言/规则命中数与内容指纹），重启即清",
+    });
+  }
+
+  if (req.method === "POST" && (path === "/admin/prompt-diagnostics/clear" || path === "/admin/prompt-diagnostics/clear/")) {
+    clearPromptDiagnostics();
     return json({ ok: true });
   }
 

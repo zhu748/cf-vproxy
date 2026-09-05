@@ -105,6 +105,20 @@ export function cleanJsonSchema(schema: unknown, depth = 0): Record<string, unkn
 
 // ===== 协议错误响应 =====
 
+/**
+ * 解析 OpenAI n 参数（原项目 resolveN 语义）：缺省 1、必须正整数、上限 maxN（默认 8）。
+ * 放在纯逻辑层，便于单测直跑（不拉起 handlers 依赖链）。
+ */
+export function resolveN(raw: unknown, maxN: number): { n: number; error?: string } {
+  const cap = maxN > 0 ? Math.floor(maxN) : 8;
+  if (raw === undefined || raw === null) return { n: 1 };
+  const v = typeof raw === "number" ? raw : NaN;
+  if (!Number.isFinite(v) || !Number.isInteger(v)) return { n: 0, error: "请求参数有误: n 必须是整数 (n must be an integer)" };
+  if (v < 1) return { n: 0, error: "请求参数有误: n 必须 >= 1 (n must be >= 1)" };
+  if (v > cap) return { n: 0, error: "请求参数有误: n 超过上限 " + cap + " (n exceeds maximum " + cap + ")" };
+  return { n: v };
+}
+
 export function errOpenAI(status: number, message: string, code?: string): Response {
   return json({ error: { message, type: status === 401 ? "invalid_request_error" : "api_error", code: code ?? null } }, status);
 }
@@ -135,6 +149,19 @@ export function partFunctionCall(p: GPart): { name: string; args?: Record<string
   const v = (p as { functionCall?: unknown }).functionCall;
   if (v && typeof v === "object" && typeof (v as { name?: unknown }).name === "string") {
     return v as { name: string; args?: Record<string, unknown> };
+  }
+  return null;
+}
+
+/** inlineData part（图像模型输出）安全访问 */
+export function partInlineData(p: GPart): { mime_type?: string; data?: string } | null {
+  const v = (p as { inlineData?: unknown }).inlineData;
+  if (v && typeof v === "object") {
+    const d = v as { mime_type?: unknown; mimeType?: unknown; data?: unknown };
+    if (typeof d.data === "string" && d.data) {
+      const mime = typeof d.mime_type === "string" ? d.mime_type : typeof d.mimeType === "string" ? d.mimeType : undefined;
+      return { mime_type: mime, data: d.data };
+    }
   }
   return null;
 }

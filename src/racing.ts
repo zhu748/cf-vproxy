@@ -31,6 +31,8 @@ export interface RacingConfig {
   dynamic_delay: boolean;
   /** 单个请求最多尝试的节点数（Workers 子请求限额保护） */
   max_attempts: number;
+  /** 节点内重试（原项目 parallel_pool_retry_enabled）：网络/5xx 错误时同一节点立即重试一次；429 仍直接冷却换节点 */
+  node_retry: boolean;
 }
 
 export const DEFAULT_RACING: RacingConfig = {
@@ -40,7 +42,42 @@ export const DEFAULT_RACING: RacingConfig = {
   hedge_delay_ms: 1000,
   dynamic_delay: false,
   max_attempts: 8,
+  node_retry: true,
 };
+
+// ---------- 定时健康巡检（原项目 proxy_health_check_*，Workers 用 Cron Triggers 驱动） ----------
+
+export interface HealthCheckConfig {
+  /** 是否启用定时健康巡检（需在 wrangler.jsonc 配置 triggers.crons） */
+  enabled: boolean;
+  /** 巡检间隔（分钟，对齐原项目 interval_minutes 默认 15） */
+  interval_minutes: number;
+  /** 每轮巡检最多测试的代理数（免费计划单次调用 50 子请求上限，默认 40 留余量） */
+  batch_size: number;
+  /** 巡检并发数 */
+  concurrency: number;
+  /** 单个代理巡检超时（秒） */
+  timeout_seconds: number;
+}
+
+export const DEFAULT_HEALTH_CHECK: HealthCheckConfig = {
+  enabled: true,
+  interval_minutes: 15,
+  batch_size: 40,
+  concurrency: 5,
+  timeout_seconds: 8,
+};
+
+export function sanitizeHealthCheckConfig(raw: unknown): HealthCheckConfig {
+  const d = raw && typeof raw === "object" ? (raw as Partial<HealthCheckConfig>) : {};
+  return {
+    enabled: d.enabled === undefined ? DEFAULT_HEALTH_CHECK.enabled : !!d.enabled,
+    interval_minutes: clampInt(d.interval_minutes, DEFAULT_HEALTH_CHECK.interval_minutes, 5, 1440),
+    batch_size: clampInt(d.batch_size, DEFAULT_HEALTH_CHECK.batch_size, 1, 40),
+    concurrency: clampInt(d.concurrency, DEFAULT_HEALTH_CHECK.concurrency, 1, 10),
+    timeout_seconds: clampInt(d.timeout_seconds, DEFAULT_HEALTH_CHECK.timeout_seconds, 2, 30),
+  };
+}
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
@@ -60,7 +97,29 @@ export function sanitizeRacingConfig(raw: unknown): RacingConfig {
     hedge_delay_ms: clampInt(d.hedge_delay_ms, DEFAULT_RACING.hedge_delay_ms, 100, 10_000),
     dynamic_delay: !!d.dynamic_delay,
     max_attempts: clampInt(d.max_attempts, DEFAULT_RACING.max_attempts, 1, 20),
+    node_retry: d.node_retry === undefined ? DEFAULT_RACING.node_retry : !!d.node_retry,
   };
+}
+
+// ---------- 定时任务纯逻辑判定（供 cron.ts 与单测使用；racing.ts 无 Workers 依赖） ----------
+
+/** 是否该跑健康巡检：开关开启 且（从未巡检过 或 距上次 ≥ interval 分钟） */
+export function sweepDue(
+  cfg: { health_check: { enabled: boolean; interval_minutes: number } },
+  lastSweepAt: number,
+  now: number,
+): boolean {
+  if (!cfg.health_check.enabled) return false;
+  if (!lastSweepAt) return true;
+  return now - lastSweepAt >= cfg.health_check.interval_minutes * 60_000;
+}
+
+/** 是否该发保活：URL 非空 且（从未发过（首次立即发，对齐原项目）或 距上次 ≥ interval 秒） */
+export function keepaliveDue(keepaliveUrl: string, keepaliveIntervalSec: number, lastAt: number, now: number): boolean {
+  if (!keepaliveUrl) return false;
+  const interval = Math.max(5, keepaliveIntervalSec) * 1000;
+  if (!lastAt) return true;
+  return now - lastAt >= interval;
 }
 
 // ---------- 健康记录 ----------

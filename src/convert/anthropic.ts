@@ -10,20 +10,46 @@ import type {
   GRequest,
   GResponse,
 } from "../types.ts";
-import { imageToInlineData, partFunctionCall, partText, randomId, textPart } from "./common.ts";
+import { imageToInlineData, partFunctionCall, partInlineData, partText, randomId, textPart } from "./common.ts";
+import { anthropicThinkingToConfig } from "../thinking.ts";
+import { applyClaudePromptPolicy, type ClaudePromptPolicy } from "../promptpolicy.ts";
 
 // ===== 请求转换 =====
 
-export async function anthropicToGemini(req: ARequest): Promise<GRequest> {
+export interface AnthropicConvertOpts {
+  /** Claude 提示词策略（推广剥离/安全前言替换/自定义替换/注入，含诊断记录）；不传则跳过 */
+  policy?: ClaudePromptPolicy;
+  /** 诊断端点标签（"generate" | "count_tokens"） */
+  endpoint?: string;
+  /** 客户端请求的模型名（规则过滤用） */
+  clientModel?: string;
+  /** 别名解析后的真实模型名（规则过滤用） */
+  resolvedModel?: string;
+}
+
+export async function anthropicToGemini(req: ARequest, opts?: AnthropicConvertOpts): Promise<GRequest> {
   const g: GRequest = { contents: [] };
   const sysParts: GPart[] = [];
 
   if (req.system) {
-    const texts =
+    let texts =
       typeof req.system === "string"
         ? [req.system]
         : (req.system ?? []).filter((b) => b.type === "text").map((b) => (b as { text: string }).text);
-    const t = texts.join("\n");
+    texts = texts.filter((x) => x);
+    // Claude 提示词策略（原项目 claude_prompt.go）：推广剥离 → 安全前言替换 → 自定义规则 → 注入；
+    // 诊断按 endpoint（generate / count_tokens）分开记录
+    if (opts?.policy && texts.length > 0) {
+      const applied = await applyClaudePromptPolicy(
+        opts.policy,
+        texts,
+        opts.clientModel ?? req.model,
+        opts.resolvedModel ?? req.model,
+        opts.endpoint ?? "generate",
+      );
+      texts = applied.segments;
+    }
+    const t = texts.filter((x) => x && x.trim()).join("\n\n");
     if (t) sysParts.push(textPart(t));
   }
 
@@ -86,9 +112,18 @@ export async function anthropicToGemini(req: ARequest): Promise<GRequest> {
   };
 
   for (const m of req.messages as AMessage[]) {
+    // Claude Code 排队消息可能把 system turn 塞进 messages[] 中途（Gemini 只支持请求级
+    // systemInstruction）：按原项目 lowerAnthropicMidConversationSystemTurns 语义降为 user
+    if (m.role === "system") {
+      const blocks: AContentBlock[] =
+        typeof m.content === "string" ? [{ type: "text", text: m.content }] : (m.content ?? []);
+      const c = await emitBlocks("user", blocks);
+      if (c) g.contents.push(c);
+      continue;
+    }
     const blocks: AContentBlock[] =
       typeof m.content === "string" ? [{ type: "text", text: m.content }] : (m.content ?? []);
-    const c = await emitBlocks(m.role, blocks);
+    const c = await emitBlocks(m.role === "assistant" ? "assistant" : "user", blocks);
     if (c) g.contents.push(c);
   }
 
@@ -124,6 +159,17 @@ export async function anthropicToGemini(req: ARequest): Promise<GRequest> {
   if (req.top_p !== undefined) gc.topP = req.top_p;
   if (req.top_k !== undefined) gc.topK = req.top_k;
   if (req.stop_sequences?.length) gc.stopSequences = req.stop_sequences;
+  // 思考强度：thinking.budget_tokens（Claude Code）/ output_config.effort（新 API）
+  const effort =
+    req.output_config && typeof req.output_config === "object" ? (req.output_config as { effort?: string }).effort : undefined;
+  if (req.thinking) {
+    const tc = anthropicThinkingToConfig(req.thinking, (req.thinking as { display?: unknown }).display);
+    if (tc) gc.thinkingConfig = tc;
+  } else if (typeof effort === "string" && effort && !["auto", "default"].includes(effort.toLowerCase())) {
+    const lvl = effort.trim().toUpperCase();
+    const level = lvl === "XHIGH" || lvl === "MAX" ? "HIGH" : (lvl as "LOW" | "MEDIUM" | "HIGH");
+    if (["LOW", "MEDIUM", "HIGH"].includes(level)) gc.thinkingConfig = { thinkingLevel: level };
+  }
   if (Object.keys(gc).length > 0) g.generationConfig = gc;
 
   return g;
@@ -160,6 +206,15 @@ export function geminiToAnthropic(g: GResponse, model: string, id: string): Reco
     const fc = partFunctionCall(p);
     if (fc) {
       content.push({ type: "tool_use", id: randomId("toolu_"), name: fc.name, input: fc.args ?? {} });
+      continue;
+    }
+    // 图像模型输出 → markdown data URI 文本块（Anthropic 无图像输出块类型）
+    const inline = partInlineData(p);
+    if (inline) {
+      content.push({
+        type: "text",
+        text: "![image](data:" + (inline.mime_type || "image/png") + ";base64," + inline.data + ")",
+      });
     }
   }
   const hasToolUse = content.some((c) => c.type === "tool_use");

@@ -4,6 +4,12 @@
 > 专为 Cloudflare Workers（免费计划即可）设计。转换层逻辑与原项目对齐，去掉了 reCAPTCHA 突破、
 > TLS 指纹伪装、mihomo 代理内核等 Workers 沙箱无法实现的部分。
 >
+> **v1.3.0 更新（全功能对齐版）**：除「无头 Vertex 匿名端点」外，原项目所有可适配 CF 的功能已全部移植：
+> ① OpenAI **n 多候选**（max_n + CompleteChatN：n 次并发上游请求合并 choices）；② **上游镜像/中转基地址**（gemini_base_url）；
+> ③ **Cron Triggers 定时任务**：定时健康巡检（proxy_health_check_*）、订阅差异更新、keepalive 保活；
+> ④ **请求指标**（原项目 metrics.go：总量/错误/延迟/状态分桶/协议分桶，JSON + Prometheus 双格式）；
+> ⑤ **节点内重试**（parallel_pool_retry_enabled）；⑥ **Claude 提示词诊断**（推广/前言/规则命中数 + 最近记录）。
+>
 > **v1.2.0 更新**：移植原项目 **并发竞速（对冲延迟 race engine）**：按健康分选候选、首胜即停、429 冷却、
 > 失败极速接力、粘性优选；节点健康度 KV 持久化；面板新增「竞速」页（配置/健康表/全量测速）。
 >
@@ -30,9 +36,13 @@ generativelanguage.googleapis.com  （Gemini 官方 API，你的单个 API Key�
 | OpenAI 协议 | `POST /v1/chat/completions`（流式/非流式）、`GET /v1/models` |
 | Anthropic 协议 | `POST /v1/messages`（流式/非流式）、`POST /v1/messages/count_tokens` |
 | Gemini 原生 | `POST /v1beta/models/{model}:generateContent / :streamGenerateContent?alt=sse / :countTokens / :predict`（请求体透传）、`GET /v1beta/models` |
-| 对话能力 | 纯文本、图片输入（base64 / URL / data URI）、工具调用（function calling 双向转换，含流式增量） |
-| **Web 管理面板** | **浏览器打开 `/admin` 即可管理一切**：仪表盘、配置、代理（增删/测试/服务端并发测速）、**竞速（配置/健康表/全量测速）**、用量统计、模型表、请求日志。深色主题，token 登录，无需 curl |
-| **并发竞速** | **移植原项目 race engine**：每请求按健康分选出多个候选节点，首个立即发出、每隔对冲延迟追加下一个（首胜即停，败者立即中止）；429 → 30s 冷却；连接/握手/5xx → 指数冷却 + 极速接力；胜出节点粘性优选。健康度 KV 持久化（冷启动不丢） |
+| 对话能力 | 纯文本、图片输入（base64 / URL / data URI）、工具调用（function calling 双向转换，含流式增量）、**n 多候选**（非流式 `n>1` 并发 n 次上游请求合并 choices，受 max_n 上限保护） |
+| **Web 管理面板** | **浏览器打开 `/admin` 即可管理一切**：仪表盘（含请求指标）、配置（含镜像基地址/max_n）、代理（增删/测试/服务端并发测速）、**竞速（配置/健康表/全量测速/定时巡检）**、用量统计、模型表、请求日志。深色主题，token 登录，无需 curl |
+| **并发竞速** | **移植原项目 race engine**：每请求按健康分选出多个候选节点，首个立即发出、每隔对冲延迟追加下一个（首胜即停，败者立即中止）；429 → 30s 冷却；连接/握手/5xx → 指数冷却 + 极速接力；胜出节点粘性优选；节点内重试（网络/5xx 同节点立即重试一次）。健康度 KV 持久化（冷启动不丢） |
+| **Cron 定时任务** | **移植原项目定时健康巡检 + keepalive**：wrangler.jsonc 预置每 15 分钟一跳的 cron；实际节奏由配置控制（巡检间隔/批量/并发/超时，keepalive 间隔 5~86400s，首次立即发送），与 cron 表达式解耦；巡检结果计入健康度，订阅在每次触发时差异更新 |
+| **请求指标** | **移植原项目 metrics.go**：请求总量/在飞/错误率/平均与峰值延迟/HTTP 状态分桶/协议分桶，isolate 内存计数 + KV 快照持久化（跨重启累计）；`GET /admin/metrics` 返回 JSON，`?format=prometheus` 返回 Prometheus 文本可直接接入抓取 |
+| **Claude 提示词诊断** | **移植原项目 prompt_diagnostics**：Claude Code 推广片段剥离数、安全前言替换命中、自定义规则命中、注入是否生效与内容指纹（隐私安全），生成与 count_tokens 分开记录，面板可见 |
+| **上游镜像/中转** | `gemini_base_url` 可填自定义基地址（裸域名自动补 `/v1beta`），留空使用官方地址，对齐原项目 gemini_api_base_url |
 | 出站代理 | SOCKS4/4a（域名自动走 4a 扩展）、SOCKS5（socks5h 语义）、HTTP CONNECT；支持 `user:pass` 认证（SOCKS4 仅 userid）；健康分排序轮换 + 失败自动接力，或对冲竞速 |
 | **不支持链接自动剔除** | 配置与订阅中的 `https://`、`vmess://` 等不支持协议**自动剔除并给出原因**（Workers 无法 TLS-in-TLS），面板可见剔除明细 |
 | 节点导入 | 手工填 `socks4://`、`socks5://`、`http://` 链接，或订阅链接批量拉取（纯文本 / Base64 均可），缓存 KV 惰性刷新 |
@@ -141,7 +151,15 @@ curl -X POST "$BASE/admin/config" \
 | `subscription` | 订阅链接。Worker 拉取解析其中 socks4/socks5/http 节点，缓存 KV，每 `subscription_refresh_minutes` 分钟（最少 5）惰性刷新；https/vmess/vless/ss 等自动跳过并计数 |
 | `model_aliases` | 模型别名映射，如把客户端请求的 `gpt-4o` 映射到 `gemini-3.7-flash` |
 | `disabled_models` | 禁用的模型名（命中即 403） |
-| `racing` | **并发竞速配置**（面板「竞速」页可视化编辑）：`enabled`（默认开）、`top_k`（候选上限，默认 6）、`max_concurrent`（同时在飞，默认 3）、`hedge_delay_ms`（对冲延迟，默认 1000）、`dynamic_delay`（用平均延迟动态对冲）、`max_attempts`（单请求最多尝试节点数，默认 8，防子请求超限） |
+| `racing` | **并发竞速配置**（面板「竞速」页可视化编辑）：`enabled`（默认开）、`top_k`（候选上限，默认 6）、`max_concurrent`（同时在飞，默认 3）、`hedge_delay_ms`（对冲延迟，默认 1000）、`dynamic_delay`（用平均延迟动态对冲）、`max_attempts`（单请求最多尝试节点数，默认 8，防子请求超限）、`node_retry`（节点内重试：网络/5xx 同节点立即重试一次，默认开；429 不重试） |
+| `health_check` | **定时健康巡检**（面板「竞速」页可视化编辑，Cron Triggers 驱动）：`enabled`（默认开）、`interval_minutes`（间隔分钟，默认 15）、`batch_size`（每轮最多测试节点数，默认 40，免费计划建议 ≤40）、`concurrency`（并发，默认 5）、`timeout_seconds`（单节点超时，默认 8） |
+| `gemini_base_url` | **上游镜像/中转基地址**（可选）。填裸域名自动补 `/v1beta`；仅接受 http(s)；留空使用官方地址。环境变量 `GEMINI_BASE_URL` 可作兑底 |
+| `max_n` | **OpenAI n 参数上限**（默认 8，1~32）。n>1 非流式时并发 n 次上游请求合并 choices；流式 n>1 返回 400 |
+| `drop_max_tokens` | 移除客户端的输出 token 上限（避免思考 token 挤占正文；Gemini 3.6+ 始终移除） |
+| `max_request_mb` / `max_concurrent_requests` | 请求体大小上限（默认 64MiB）/ 全局并发门（超出 503 + Retry-After） |
+| `aggregate_stream` | 聚合流：所有端点把非流式响应伪装成流式（无需 fake- 前缀） |
+| `keepalive_url` / `keepalive_interval` | 部署保活地址（Cron 心跳触发 GET）/ 间隔（5~86400 秒，首次立即发送） |
+| `claude_prompt` | **Claude 提示词策略**：推广片段剥离、安全前言替换、自定义字面量替换（≤32 条可按模型过滤）、额外 system 注入；处理结果可在 `/admin/prompt-diagnostics` 查看 |
 
 ### 代理与订阅管理
 
@@ -188,6 +206,47 @@ curl -X POST "$BASE/admin/logs/clear" -H "Authorization: Bearer $TOKEN"
 
 **SOCKS4 说明**：目标是域名时自动使用 SOCKS4a 扩展（ userid 后跟域名，由代理解析 DNS）；
 绝大多数现代 SOCKS4 代理（Dante、3proxy 等）支持 4a。SOCKS4 协议没有密码字段，URL 中的密码会被忽略。
+
+### v1.3.0 新增：定时巡检 / 节点内重试 / 请求指标 / n 多候选 / 镜像基地址 / 提示词诊断
+
+**1. Cron 定时健康巡检 + keepalive 保活**（wrangler.jsonc 已预置 `*/15 * * * *` 心跳）：
+
+实际节奏由面板「竞速」页的巡检配置控制（KV 时间戳判重，与 cron 表达式解耦）。
+巡检结果计入节点健康度（失败进入指数冷却），订阅链接在每次触发时同步差异更新：
+
+```bash
+# 手动触发一轮巡检（与定时任务同一实现，按巡检配置的批量/并发/超时执行）
+curl -X POST "$BASE/admin/health/sweep" -H "Authorization: Bearer $TOKEN"
+
+# keepalive：面板「配置页」填 keepalive_url 即启用（首次立即 GET，后续按间隔）
+```
+
+**2. 请求指标（原项目 metrics.go 语义）**：
+
+```bash
+# JSON 快照（总量/在飞/错误/平均与峰值延迟/状态分桶/协议分桶；跨重启累计）
+curl "$BASE/admin/metrics" -H "Authorization: Bearer $TOKEN"
+
+# Prometheus 文本格式（可直接被 Prometheus/VictoriaMetrics 抓取）
+curl "$BASE/admin/metrics?format=prometheus" -H "Authorization: Bearer $TOKEN"
+```
+
+**3. OpenAI n 多候选**（原项目 max_n + CompleteChatN）：非流式 `"n": 3` 会并发发起 3 次上游请求，
+合并为 choices[0..2]（usage 累加）；流式 `n>1` 返回 400；超过 max_n 上限（默认 8，面板可配 1~32）返回 400。
+
+**4. 节点内重试**（原项目 parallel_pool_retry_enabled，面板「竞速」页开关）：
+顺序模式下网络层错误/上游 5xx 时同一节点立即重试一次；429 不重试，直接冷却换节点。
+
+**5. 上游镜像/中转**（配置页「上游镜像/中转基地址」或 `gemini_base_url` 字段）：
+填裸域名自动补 `/v1beta`，留空使用官方地址；仅接受 http(s)。也支持环境变量 `GEMINI_BASE_URL` 兑底。
+
+**6. Claude 提示词诊断**：
+
+```bash
+curl "$BASE/admin/prompt-diagnostics" -H "Authorization: Bearer $TOKEN"
+# 返回 generate / count_tokens 两个端点最近一次 system 处理结果：
+# 推广片段命中数、安全前言替换命中、自定义规则命中、注入是否生效、内容指纹（16 hex，隐私安全）
+```
 
 ## 五、用量统计（持久化"记忆"）
 
@@ -268,7 +327,7 @@ gemini-3.5-flash-lite / gemini-3.5-flash / gemini-3.6-flash / gemini-3.7-flash /
 ```bash
 npm install
 npm run typecheck          # tsc --noEmit
-npm test                   # 62 个单元测试（协议帧/SOCKS4/代理清洗/字节流/转换层/配置兼容/竞速与健康度）
+npm test                   # 76 个单元测试（协议帧/SOCKS4/代理清洗/字节流/转换层/配置兼容/竞速与健康度/n 多候选/metrics/cron 判定）
 npm run dev                # wrangler 本地 dev（代理隧道需真实出网，建议 deploy 后实测）
 ```
 

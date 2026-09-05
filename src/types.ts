@@ -1,6 +1,7 @@
 // ===== 通用 Gemini (official REST) 类型 =====
 
 import type { RacingConfig } from "./racing.ts";
+import type { ThinkingConfig } from "./thinking.ts";
 
 export interface GPartText { text: string }
 export interface GPartFunctionCall { functionCall: { name: string; args?: Record<string, unknown> } }
@@ -53,6 +54,10 @@ export interface GGenerationConfig {
   responseJsonSchema?: GSchemaLike;
   presencePenalty?: number;
   frequencyPenalty?: number;
+  thinkingConfig?: ThinkingConfig;
+  responseModalities?: string[];
+  imageConfig?: Record<string, unknown>;
+  speechConfig?: Record<string, unknown>;
 }
 
 export interface GSafetySetting { category: string; threshold: string }
@@ -88,6 +93,9 @@ export interface GResponse {
   usageMetadata?: GUsageMetadata;
   modelVersion?: string;
   responseId?: string;
+  createTime?: string;
+  modelStatus?: string;
+  error?: { code?: number; message?: string; status?: string };
 }
 
 // ===== OpenAI Chat Completions 类型（子集） =====
@@ -134,6 +142,7 @@ export interface ORequest {
   parallel_tool_calls?: boolean;
   frequency_penalty?: number;
   presence_penalty?: number;
+  reasoning_effort?: string;
   [k: string]: unknown;
 }
 
@@ -151,7 +160,7 @@ export type AContentBlock =
   | { type: "document"; source: { type: "base64"; media_type: string; data: string } }
   | { type: string; [k: string]: unknown };
 
-export interface AMessage { role: "user" | "assistant"; content: string | AContentBlock[] }
+export interface AMessage { role: "user" | "assistant" | "system"; content: string | AContentBlock[] }
 
 export interface AToolDef { name: string; description?: string; input_schema: Record<string, unknown> }
 
@@ -168,6 +177,48 @@ export interface ARequest {
   tools?: AToolDef[];
   tool_choice?: { type: "auto" | "any" | "tool"; name?: string };
   metadata?: { user_id?: string };
+  thinking?: { type?: string; budget_tokens?: number };
+  output_config?: { effort?: string } | string;
+}
+
+// ===== OpenAI Responses API（/v1/responses，移植自原项目 responses_handler.go） =====
+
+export interface RInputImage { url?: string; detail?: string }
+
+export interface RInputItem {
+  type?: string; // ""/message/function_call/function_call_output/reasoning
+  role?: string;
+  content?: string | Array<{ type?: string; text?: string; image_url?: RInputImage | string }>;
+  call_id?: string;
+  id?: string;
+  name?: string;
+  arguments?: unknown;
+  output?: unknown;
+  namespace?: string;
+  summary?: unknown;
+  [k: string]: unknown;
+}
+
+export interface RToolFunction { name: string; description?: string; parameters?: Record<string, unknown>; strict?: boolean }
+export type RTool = { type: "function"; name?: string; description?: string; parameters?: Record<string, unknown>; strict?: boolean } | { type: "namespace"; name: string; tools?: RTool[] } | { type: string; [k: string]: unknown };
+
+export interface RRequest {
+  model: string;
+  input?: string | RInputItem[];
+  instructions?: string | Array<{ type?: string; text?: string }>;
+  stream?: boolean;
+  temperature?: number;
+  top_p?: number;
+  max_output_tokens?: number;
+  parallel_tool_calls?: boolean;
+  reasoning?: { effort?: string; summary?: unknown };
+  text?: { format?: { type?: string; json_schema?: { name?: string; schema?: unknown; strict?: boolean } } };
+  tools?: RTool[];
+  tool_choice?: string | { type?: string; name?: string; function?: { name?: string } };
+  metadata?: unknown;
+  previous_response_id?: string | null;
+  store?: boolean;
+  truncation?: string;
 }
 
 // ===== Worker 配置 =====
@@ -184,4 +235,24 @@ export interface VProxyConfig {
   subscription_refresh_minutes: number;
   /** 并发竞速与节点健康度（移植自原项目对冲竞速） */
   racing: RacingConfig;
+  /** 移除客户端的输出 token 上限（避免思考 token 挤占正文；Gemini 3.6+ 始终移除） */
+  drop_max_tokens: boolean;
+  /** 单次 HTTP 请求体上限（MiB，钳位 1–1024） */
+  max_request_mb: number;
+  /** 全局并发上游请求门（超出返回 503 + Retry-After） */
+  max_concurrent_requests: number;
+  /** 聚合流：所有端点把非流式响应伪装成流式（无需 fake- 前缀） */
+  aggregate_stream: boolean;
+  /** 上游 Gemini 官方 API 基地址覆盖（镜像/中转，原项目 gemini_api_base_url）；留空使用官方地址 */
+  gemini_base_url: string;
+  /** OpenAI n 参数上限（原项目 max_n，默认 8、钳位 1–32）；n>1 时并发 n 次上游请求合并 choices */
+  max_n: number;
+  /** 定时健康巡检（原项目 proxy_health_check_*，由 Cron Triggers 驱动） */
+  health_check: import("./racing.ts").HealthCheckConfig;
+  /** 部署保活地址（配合 Cron Triggers 定时 GET；留空关闭） */
+  keepalive_url: string;
+  /** 保活间隔（秒，5–86400，仅作文档提示；实际节奏由 Cron 触发器决定） */
+  keepalive_interval: number;
+  /** Claude 提示词策略（/v1/messages 与 count_tokens 生效） */
+  claude_prompt: import("./promptpolicy.ts").ClaudePromptPolicy;
 }

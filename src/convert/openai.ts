@@ -12,7 +12,8 @@ import type {
   OMessage,
   ORequest,
 } from "../types.ts";
-import { bytesToBase64, cleanJsonSchema, imageToInlineData, partFunctionCall, partText, randomId, textPart } from "./common.ts";
+import { bytesToBase64, cleanJsonSchema, imageToInlineData, partFunctionCall, partInlineData, partText, randomId, textPart } from "./common.ts";
+import { reasoningEffortToLevel } from "../thinking.ts";
 
 // ===== 请求转换 =====
 
@@ -136,6 +137,9 @@ export async function openaiToGemini(req: ORequest): Promise<GRequest> {
     const schema = (req.response_format as { json_schema?: { schema?: unknown } }).json_schema?.schema;
     if (schema) gc.responseJsonSchema = cleanJsonSchema(schema);
   }
+  // 思考强度：reasoning_effort（auto/default 不设置，让模型用默认行为）
+  const effortLevel = reasoningEffortToLevel(req.reasoning_effort);
+  if (effortLevel) gc.thinkingConfig = { thinkingLevel: effortLevel };
   if (Object.keys(gc).length > 0) g.generationConfig = gc;
 
   return g;
@@ -198,6 +202,12 @@ export function geminiToOpenAI(g: GResponse, model: string, id: string, created:
         type: "function",
         function: { name: fc.name, arguments: JSON.stringify(fc.args ?? {}) },
       });
+      continue;
+    }
+    // 图像模型（如 gemini-3.1-flash-image）返回的 inlineData → markdown data URI，聊天客户端可直接渲染
+    const inline = partInlineData(p);
+    if (inline) {
+      text += "![image](data:" + (inline.mime_type || "image/png") + ";base64," + inline.data + ")\n";
     }
   }
   const message: Record<string, unknown> = { role: "assistant", content: text || null };
@@ -263,6 +273,16 @@ export async function* geminiSseToOpenaiChunks(
           ...chunkHeader(),
           choices: [{ index: 0, delta: { tool_calls: [tc] }, finish_reason: null }],
         });
+      } else {
+        const inline = partInlineData(p);
+        if (inline) {
+          yield emit({
+            ...chunkHeader(),
+            choices: [
+              { index: 0, delta: { content: "![image](data:" + (inline.mime_type || "image/png") + ";base64," + inline.data + ")\n" }, finish_reason: null, logprobs: null },
+            ],
+          });
+        }
       }
     }
     if (cand?.finishReason && !finishSent) {

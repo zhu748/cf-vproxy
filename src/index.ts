@@ -23,10 +23,12 @@ import type { Env } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { resolveProxyPool } from "./proxy/proxyfetch.ts";
 import { flushIfDue } from "./usage.ts";
+import { flushMetricsIfDue, metricsBegin, metricsFinish } from "./metrics.ts";
+import { runScheduledTasks } from "./cron.ts";
 import { maskClientKey, protocolOf, pushLog } from "./logs.ts";
 import type { HandlerCtx } from "./upstream.ts";
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -61,12 +63,41 @@ function serviceInfo(): Response {
     version: VERSION,
     based_on: "vertex-master (official 单 Key 直连模式)",
     panel: "/admin",
-    features: ["openai/anthropic/gemini 三协议转换", "socks4/4a/socks5/http 出站代理", "对冲竞速（原项目 race engine 移植）", "节点健康度 + 粘性优选", "订阅拉取 + 不支持协议自动剔除", "KV 配置热更新", "用量/请求日志持久化"],
+    features: [
+      "openai/anthropic/gemini 三协议转换",
+      "socks4/4a/socks5/http 出站代理",
+      "对冲竞速（原项目 race engine 移植）",
+      "节点健康度 + 粘性优选 + 节点内重试",
+      "Cron 定时健康巡检 / 订阅差异更新 / keepalive 保活",
+      "OpenAI n 多候选（max_n，原项目 CompleteChatN 移植）",
+      "上游镜像/中转基地址（gemini_base_url）",
+      "请求指标（JSON / Prometheus）+ Claude 提示词诊断",
+      "订阅拉取 + 不支持协议自动剔除",
+      "KV 配置热更新",
+      "用量/请求日志持久化",
+    ],
     endpoints: {
       openai: ["GET /v1/models", "POST /v1/chat/completions"],
       anthropic: ["POST /v1/messages", "POST /v1/messages/count_tokens"],
       gemini: ["GET /v1beta/models", "POST /v1beta/models/{model}:{generateContent|streamGenerateContent|countTokens|predict}"],
-      admin: ["GET /admin (Web 面板)", "GET /admin/config", "POST /admin/config", "GET /admin/models", "GET /admin/usage", "POST /admin/usage/reset", "GET /admin/logs", "POST /admin/logs/clear", "POST /admin/proxies/refresh", "POST /admin/proxy/test", "POST /admin/proxies/test-all", "GET /admin/health", "POST /admin/health/reset"],
+      admin: [
+        "GET /admin (Web 面板)",
+        "GET|POST /admin/config",
+        "GET /admin/models",
+        "GET /admin/usage",
+        "POST /admin/usage/reset",
+        "GET /admin/logs",
+        "POST /admin/logs/clear",
+        "POST /admin/proxies/refresh",
+        "POST /admin/proxy/test",
+        "POST /admin/proxies/test-all",
+        "GET /admin/health",
+        "POST /admin/health/sweep (手动巡检)",
+        "POST /admin/health/reset",
+        "GET /admin/metrics[?format=prometheus]",
+        "GET /admin/prompt-diagnostics",
+        "POST /admin/prompt-diagnostics/clear",
+      ],
     },
     outbound_proxies: ["socks4://", "socks4a://", "socks5://", "http://"],
     proxy_notes: "https:// 代理在 Workers 上不可用（无法 TLS-in-TLS），配置与订阅中的此类链接会被自动剔除",
@@ -80,9 +111,12 @@ export default {
     }
     const started = Date.now();
     const url = new URL(req.url);
+    metricsBegin();
     try {
       const resp = await route(req, env, ctx);
       ctx.waitUntil(flushIfDue(env));
+      ctx.waitUntil(flushMetricsIfDue(env));
+      metricsFinish(resp.status, Date.now() - started, protocolOf(url.pathname));
       pushLog({
         at: new Date().toISOString(),
         protocol: protocolOf(url.pathname),
@@ -98,6 +132,7 @@ export default {
       return withCors(resp);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
+      metricsFinish(500, Date.now() - started, protocolOf(url.pathname));
       pushLog({
         at: new Date().toISOString(),
         protocol: protocolOf(url.pathname),
@@ -112,6 +147,15 @@ export default {
       });
       return withCors(errOpenAI(500, "internal error: " + message));
     }
+  },
+
+  // Cron Triggers：定时健康巡检 + 订阅差异更新 + keepalive 保活（见 src/cron.ts）
+  async scheduled(_controller: unknown, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      runScheduledTasks(env).catch((e) => {
+        console.log("[cron] scheduled tasks failed:", e instanceof Error ? e.message : String(e));
+      }),
+    );
   },
 } satisfies ExportedHandler<Env>;
 

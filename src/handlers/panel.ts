@@ -163,6 +163,11 @@ const PANEL_HTML = `
     </div>
   </div>
   <div class="card" style="margin-top:14px">
+    <h3>请求指标（原项目 metrics.go 语义；跨 isolate 持久化）</h3>
+    <div class="grid g4" id="dash-metrics" style="margin-top:10px"><div class="empty">加载中...</div></div>
+    <div class="scroll" id="dash-metrics-detail" style="margin-top:8px"></div>
+  </div>
+  <div class="card" style="margin-top:14px">
     <h3>服务信息</h3>
     <div class="scroll" id="dash-info"></div>
   </div>
@@ -189,6 +194,11 @@ const PANEL_HTML = `
       </div>
     </div>
     <div class="field">
+      <label>上游镜像/中转基地址（可选，对齐原项目 gemini_api_base_url）</label>
+      <input id="cfg-baseurl" type="text" style="width:100%;font-family:var(--mono)" placeholder="留空使用官方 https://generativelanguage.googleapis.com/v1beta">
+      <div class="hint">填镜像站域名（自动补 /v1beta）或完整基地址；仅接受 http(s)://</div>
+    </div>
+    <div class="field">
       <label>订阅链接（自动拉取 socks4/socks5/http 节点；https 等不支持协议自动剔除）</label>
       <input id="cfg-sub" type="text" style="width:100%;font-family:var(--mono)" placeholder="https://example.com/sub?token=xxx">
       <div class="row" style="margin-top:8px;align-items:center">
@@ -213,6 +223,11 @@ const PANEL_HTML = `
         <input id="cfg-disabled-in" placeholder="模型名，如 gemini-3.8-flash" style="flex:1;min-width:220px;font-family:var(--mono)">
         <button class="btn ghost sm" id="cfg-disabled-add">+ 添加</button>
       </div>
+    </div>
+    <div class="field" style="margin-bottom:6px">
+      <label>n 参数上限 max_n（1~32，默认 8；n&gt;1 非流式时并发 n 次上游请求合并 choices）</label>
+      <input id="cfg-maxn" type="number" min="1" max="32" style="width:120px">
+      <div class="hint">移植自原项目 max_n + CompleteChatN；流式请求 n&gt;1 会返回 400</div>
     </div>
   </div>
 </section>
@@ -259,6 +274,10 @@ const PANEL_HTML = `
         <div class="hint">开启后 hedge_delay_ms 被平均延迟（100ms~10s）取代</div>
       </div>
       <div class="field">
+        <label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" id="race-nretry" style="width:auto"> 节点内重试（网络/5xx 同节点立即重试一次）</label>
+        <div class="hint">对齐原项目 parallel_pool_retry_enabled；429 不重试，直接冷却换节点</div>
+      </div>
+      <div class="field">
         <label>候选上限 top_k（按健康分取前 K，1~16）</label>
         <input id="race-topk" type="number" min="1" max="16" style="width:140px">
       </div>
@@ -282,12 +301,42 @@ const PANEL_HTML = `
       <div class="row">
         <button class="btn ghost sm" id="race-refresh">刷新</button>
         <button class="btn sm" id="race-test-all">全量测速</button>
+        <button class="btn ghost sm" id="race-sweep">执行巡检</button>
         <button class="btn danger sm" id="race-reset">重置健康度</button>
       </div>
     </div>
     <div class="grid g4" id="race-stats" style="margin-bottom:12px"></div>
     <div class="scroll" id="race-tbl"><div class="empty">暂无数据 —— 发起请求或执行全量测速后生成</div></div>
     <div id="race-test-report" style="margin-top:10px"></div>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <div class="row" style="justify-content:space-between;margin-bottom:6px">
+      <h3 style="margin:0">定时健康巡检（原项目 proxy_health_check_*，由 Cron Triggers 驱动）</h3>
+      <button class="btn ghost sm" id="hc-save">保存巡检配置</button>
+    </div>
+    <div class="hint" style="margin-bottom:12px">wrangler.jsonc 已预置每 15 分钟一跳的 cron（triggers.crons）；实际节奏由下方间隔控制，与 cron 解耦。巡检结果计入健康度，失败节点进入指数冷却。免费计划单次调用限 50 子请求，建议批量 ≤40。</div>
+    <div class="grid g2">
+      <div class="field">
+        <label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" id="hc-enabled" style="width:auto"> 启用定时巡检</label>
+        <div class="hint">关闭后仍可手动巡检/全量测速</div>
+      </div>
+      <div class="field">
+        <label>巡检间隔 interval_minutes（5~1440）</label>
+        <input id="hc-interval" type="number" min="5" max="1440" style="width:140px"> <span style="font-size:12.5px;color:var(--muted)">分钟</span>
+      </div>
+      <div class="field">
+        <label>每轮批量 batch_size（1~40）</label>
+        <input id="hc-batch" type="number" min="1" max="40" style="width:140px">
+      </div>
+      <div class="field">
+        <label>并发数 concurrency（1~10）</label>
+        <input id="hc-cc" type="number" min="1" max="10" style="width:140px">
+      </div>
+      <div class="field">
+        <label>单节点超时 timeout_seconds（2~30）</label>
+        <input id="hc-timeout" type="number" min="2" max="30" style="width:140px"> <span style="font-size:12.5px;color:var(--muted)">秒</span>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -418,10 +467,11 @@ function statCard(num, sub, cls){
   return '<div class="card stat ' + (cls || "") + '"><div class="num">' + num + '</div><div class="sub">' + sub + '</div></div>';
 }
 LOADERS.dash = function(){
-  Promise.all([api("/usage"), api("/logs"), api("/config")]).then(function(rs){
+  Promise.all([api("/usage"), api("/logs"), api("/config"), api("/metrics")]).then(function(rs){
     var totals = rs[0].totals || {};
     var logs = rs[1].logs || [];
     var cfg = rs[2];
+    var mt = rs[3].metrics || {};
     $("dash-stats").innerHTML =
       statCard(fmtN(totals.requests), "总请求数", "c-accent") +
       statCard(fmtN(totals.input_tokens), "输入 tokens", "") +
@@ -429,6 +479,21 @@ LOADERS.dash = function(){
       statCard(fmtN(totals.keys), "客户端 Key", "") +
       statCard(fmtN((cfg.proxies || []).length), "出站代理", "c-warn") +
       statCard(cfg.gemini_key ? "已配置" : "未配置", "上游 Gemini Key", cfg.gemini_key ? "c-ok" : "c-warn");
+    var st = mt.status || {};
+    var errRate = mt.total ? Math.round((mt.errors / mt.total) * 1000) / 10 : 0;
+    $("dash-metrics").innerHTML =
+      statCard(fmtN(mt.total), "请求总量（跨重启）", "c-accent") +
+      statCard(fmtN(mt.errors) + ' <span style="font-size:12px;color:var(--muted)">(' + errRate + '%)</span>', "4xx/5xx 错误", mt.errors ? "c-warn" : "c-ok") +
+      statCard(fmtN(mt.active), "当前在飞", "") +
+      statCard(Math.round(mt.average_latency_ms || 0) + "ms", "平均延迟（峰值 " + fmtN(mt.maximum_latency_ms || 0) + "ms）", "c-purple");
+    var proto = mt.protocol || {};
+    var protoKeys = Object.keys(proto);
+    var detail = protoKeys.length
+      ? '<table class="tbl"><tbody>' + protoKeys.map(function(p){
+          return '<tr><td style="white-space:nowrap;color:var(--muted);width:120px">' + esc(p) + '</td><td class="num">' + fmtN(proto[p]) + '</td></tr>';
+        }).join("") + '</tbody></table>'
+      : '<div class="empty">暂无分协议数据 —— 发起一次请求后刷新</div>';
+    $("dash-metrics-detail").innerHTML = '<div style="font-size:12.5px;color:var(--muted);margin-bottom:6px">状态分布：2xx ' + fmtN(st.successful) + ' · 3xx ' + fmtN(st.redirection) + ' · 4xx ' + fmtN(st.client_error) + ' · 5xx ' + fmtN(st.server_error) + '　|　Prometheus 格式：/admin/metrics?format=prometheus</div>' + detail;
     var tm = totals.top_models || [];
     if (tm.length){
       var max = tm[0].requests || 1;
@@ -444,12 +509,13 @@ LOADERS.dash = function(){
       }).join("") + '</tbody></table>';
     }
     $("dash-info").innerHTML = '<table class="tbl"><tbody>' + [
-      ["OpenAI 协议", "POST /v1/chat/completions · GET /v1/models"],
+      ["OpenAI 协议", "POST /v1/chat/completions · GET /v1/models（支持 n 多候选，max_n 上限）"],
       ["Anthropic 协议", "POST /v1/messages · POST /v1/messages/count_tokens"],
       ["Gemini 原生", "POST /v1beta/models/{model}:{generateContent|streamGenerateContent|countTokens|predict}"],
       ["出站代理", "socks4/4a · socks5 · http CONNECT（https 代理不支持，自动剔除）"],
-      ["出站模式", "对冲竞速 / 健康轮换（面板「竞速」页可配）"],
-      ["上游模式", "Gemini 官方 API 单 Key 直连（official）"]
+      ["出站模式", "对冲竞速 / 健康轮换 + 节点内重试（面板「竞速」页可配）"],
+      ["定时任务", "Cron Triggers：健康巡检 · 订阅差异更新 · keepalive 保活"],
+      ["上游模式", "Gemini 官方 API 单 Key 直连（official）· 支持镜像/中转基地址"]
     ].map(function(r){ return '<tr><td style="white-space:nowrap;color:var(--muted);width:120px">' + r[0] + '</td><td><code>' + r[1] + '</code></td></tr>'; }).join("") + '</tbody></table>';
   }).catch(function(e){ if (e.message !== "NEED_LOGIN") toast("加载失败：" + e.message, "err"); });
 };
@@ -485,6 +551,8 @@ LOADERS.cfg = function(){
     PX = (j.proxies || []).slice();
     ALIASES = Object.assign({}, j.model_aliases || {});
     $("cfg-gemini").value = j.gemini_key || "";
+    $("cfg-baseurl").value = j.gemini_base_url || "";
+    $("cfg-maxn").value = j.max_n != null ? j.max_n : 8;
     $("cfg-sub").value = j.subscription || "";
     $("cfg-sub-min").value = j.subscription_refresh_minutes || 30;
     renderKeys(); renderAliases(); renderDisabled();
@@ -518,6 +586,8 @@ $("cfg-save").onclick = function(){
   var btn = this;
   var body = {
     gemini_key: $("cfg-gemini").value.trim(),
+    gemini_base_url: $("cfg-baseurl").value.trim(),
+    max_n: Math.min(32, Math.max(1, parseInt($("cfg-maxn").value, 10) || 8)),
     api_keys: CFG.api_keys,
     subscription: $("cfg-sub").value.trim(),
     subscription_refresh_minutes: Math.max(5, parseInt($("cfg-sub-min").value, 10) || 30),
@@ -679,10 +749,17 @@ function renderRaceForm(){
   var r = (CFG && CFG.racing) || {};
   $("race-enabled").checked = !!r.enabled;
   $("race-dynamic").checked = !!r.dynamic_delay;
+  $("race-nretry").checked = r.node_retry === undefined ? true : !!r.node_retry;
   $("race-topk").value = r.top_k != null ? r.top_k : 6;
   $("race-mc").value = r.max_concurrent != null ? r.max_concurrent : 3;
   $("race-delay").value = r.hedge_delay_ms != null ? r.hedge_delay_ms : 1000;
   $("race-ma").value = r.max_attempts != null ? r.max_attempts : 8;
+  var hc = (CFG && CFG.health_check) || {};
+  $("hc-enabled").checked = hc.enabled === undefined ? true : !!hc.enabled;
+  $("hc-interval").value = hc.interval_minutes != null ? hc.interval_minutes : 15;
+  $("hc-batch").value = hc.batch_size != null ? hc.batch_size : 40;
+  $("hc-cc").value = hc.concurrency != null ? hc.concurrency : 5;
+  $("hc-timeout").value = hc.timeout_seconds != null ? hc.timeout_seconds : 8;
 }
 function renderHealthTable(){
   var h = (HEALTH && HEALTH.health) || {};
@@ -734,6 +811,7 @@ $("race-save").onclick = function(){
   var body = { racing: {
     enabled: $("race-enabled").checked,
     dynamic_delay: $("race-dynamic").checked,
+    node_retry: $("race-nretry").checked,
     top_k: parseInt($("race-topk").value, 10) || 6,
     max_concurrent: parseInt($("race-mc").value, 10) || 3,
     hedge_delay_ms: parseInt($("race-delay").value, 10) || 1000,
@@ -750,6 +828,42 @@ $("race-save").onclick = function(){
   });
 };
 $("race-refresh").onclick = function(){ LOADERS.race(); };
+$("hc-save").onclick = function(){
+  var btn = this;
+  var body = { health_check: {
+    enabled: $("hc-enabled").checked,
+    interval_minutes: Math.max(5, parseInt($("hc-interval").value, 10) || 15),
+    batch_size: Math.min(40, Math.max(1, parseInt($("hc-batch").value, 10) || 40)),
+    concurrency: Math.min(10, Math.max(1, parseInt($("hc-cc").value, 10) || 5)),
+    timeout_seconds: Math.min(30, Math.max(2, parseInt($("hc-timeout").value, 10) || 8))
+  } };
+  btn.disabled = true; btn.textContent = "保存中...";
+  api("/config", { method: "POST", body: JSON.stringify(body) }).then(function(j){
+    btn.disabled = false; btn.textContent = "保存巡检配置";
+    CFG = j.config; delete CFG._hint;
+    toast("巡检配置已保存", "ok");
+  }).catch(function(e){
+    btn.disabled = false; btn.textContent = "保存巡检配置";
+    if (e.message !== "NEED_LOGIN") toast("保存失败：" + e.message, "err");
+  });
+};
+$("race-sweep").onclick = function(){
+  var btn = this;
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 巡检中';
+  $("race-test-report").innerHTML = '<div style="color:var(--muted);font-size:12.5px"><span class="spin"></span> 按巡检配置执行中（批量 ≤40 / 超时按配置）...</div>';
+  api("/health/sweep", { method: "POST" }).then(function(j){
+    btn.disabled = false; btn.textContent = "执行巡检";
+    var rep = j.report || {};
+    var rows = rep.results || [];
+    $("race-test-report").innerHTML = '<div class="report" style="background:rgba(91,140,255,.05);border-color:rgba(91,140,255,.25)"><div class="t" style="color:var(--accent2)">巡检完成（' + (rep.ok || 0) + '/' + (rep.tested || 0) + ' 可用，耗时 ' + rep.duration_ms + 'ms，已写入健康度）</div><ul>' +
+      rows.slice(0, 40).map(function(x){ return '<li style="color:' + (x.ok ? "var(--ok)" : "var(--err)") + '">' + esc(x.proxy) + ' —— ' + (x.ok ? x.latency_ms + "ms" : esc(x.error || "失败")) + '</li>'; }).join("") + '</ul></div>';
+    toast("巡检完成：" + (rep.ok || 0) + "/" + (rep.tested || 0) + " 可用", "ok");
+    LOADERS.race();
+  }).catch(function(e){
+    btn.disabled = false; btn.textContent = "执行巡检";
+    if (e.message !== "NEED_LOGIN") toast(e.message, "err");
+  });
+};
 $("race-reset").onclick = function(){
   if (!confirm("确定清空所有节点健康度？胜出记忆与冷却状态将重建。")) return;
   api("/health/reset", { method: "POST" }).then(function(){ toast("健康度已重置", "ok"); LOADERS.race(); })

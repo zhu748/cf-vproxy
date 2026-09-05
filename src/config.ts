@@ -5,7 +5,8 @@
 //   - 上游 Gemini Key 为单个（对齐原项目“单 Key 直连”模式），兼容读取旧版 gemini_keys 数组；
 //   - 保存/加载时自动清洗代理列表：https:// 等不支持的链接直接剔除（Workers 无法 TLS-in-TLS）。
 import { cleanProxyList } from "./proxy/frames.ts";
-import { DEFAULT_RACING, sanitizeRacingConfig } from "./racing.ts";
+import { DEFAULT_RACING, sanitizeRacingConfig, DEFAULT_HEALTH_CHECK, sanitizeHealthCheckConfig } from "./racing.ts";
+import { DEFAULT_CLAUDE_PROMPT_POLICY, sanitizeClaudePromptPolicy } from "./promptpolicy.ts";
 import type { VProxyConfig } from "./types.ts";
 
 export interface Env {
@@ -14,6 +15,7 @@ export interface Env {
   API_KEYS?: string; // 逗号分隔（客户端鉴权 Key）
   GEMINI_API_KEY?: string; // 新：单个上游 Key
   GEMINI_API_KEYS?: string; // 兼容旧：逗号分隔，取第一个
+  GEMINI_BASE_URL?: string; // 可选：上游镜像/中转基地址
   PROXY_URLS?: string; // 逗号分隔
   ADMIN_TOKEN?: string; // 管理端点鉴权 token
 }
@@ -32,6 +34,11 @@ export function parseList(raw: string | undefined): string[] {
     .filter((s) => s.length > 0);
 }
 
+function clampNum(v: unknown, def: number, lo: number, hi: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.floor(Math.min(hi, Math.max(lo, n))) : def;
+}
+
 export function defaultConfig(env: Env): VProxyConfig {
   return {
     gemini_key: parseList(env.GEMINI_API_KEY)[0] ?? parseList(env.GEMINI_API_KEYS)[0] ?? "",
@@ -42,7 +49,32 @@ export function defaultConfig(env: Env): VProxyConfig {
     disabled_models: [],
     subscription_refresh_minutes: 30,
     racing: { ...DEFAULT_RACING },
+    drop_max_tokens: false,
+    max_request_mb: 64,
+    max_concurrent_requests: 16,
+    aggregate_stream: false,
+    gemini_base_url: sanitizeBaseUrl(env.GEMINI_BASE_URL),
+    max_n: 8,
+    health_check: { ...DEFAULT_HEALTH_CHECK },
+    keepalive_url: "",
+    keepalive_interval: 60,
+    claude_prompt: { ...DEFAULT_CLAUDE_PROMPT_POLICY, replacements: [] },
   };
+}
+
+export function sanitizeBaseUrl(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  let v = raw.trim().replace(/\/+$/, "");
+  if (!v) return "";
+  if (!/^https?:\/\//i.test(v)) return ""; // 仅接受 http(s)，其余视为无效回退官方
+  try {
+    const u = new URL(v);
+    // 裸域名（无路径）自动补 /v1beta，便于直接填镜像站域名
+    if (u.pathname === "" || u.pathname === "/") v = u.origin + "/v1beta";
+  } catch {
+    return "";
+  }
+  return v;
 }
 
 export function sanitizeConfig(raw: unknown): VProxyConfig {
@@ -74,6 +106,16 @@ export function sanitizeConfig(raw: unknown): VProxyConfig {
     disabled_models: arr(d.disabled_models),
     subscription_refresh_minutes: Math.floor(refresh),
     racing: sanitizeRacingConfig(d.racing),
+    drop_max_tokens: !!d.drop_max_tokens,
+    max_request_mb: clampNum(d.max_request_mb, 64, 1, 1024),
+    max_concurrent_requests: clampNum(d.max_concurrent_requests, 16, 1, 1000),
+    aggregate_stream: !!d.aggregate_stream,
+    gemini_base_url: sanitizeBaseUrl(d.gemini_base_url),
+    max_n: clampNum(d.max_n, 8, 1, 32),
+    health_check: sanitizeHealthCheckConfig(d.health_check),
+    keepalive_url: typeof d.keepalive_url === "string" ? d.keepalive_url.trim() : "",
+    keepalive_interval: clampNum(d.keepalive_interval, 60, 5, 86_400),
+    claude_prompt: sanitizeClaudePromptPolicy(d.claude_prompt),
   };
 }
 

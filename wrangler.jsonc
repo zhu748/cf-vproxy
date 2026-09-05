@@ -19,5 +19,11 @@
   ],
   // 非敏感配置可以放 vars（敏感的一律用 `wrangler secret put`）
   "vars": {},
+  // Cron Triggers（免费计划可用）：驱动定时健康巡检 / 订阅差异更新 / keepalive 保活。
+  // 默认每 15 分钟一跳（对齐原项目巡检间隔）；实际节奏由面板里的 interval_minutes /
+  // keepalive_interval 控制（KV 时间戳判重，cron 只负责心跳）。
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
   // 免费计划 CPU 限制为 10ms/请求，纯 JSON 转换足够；无需额外设置
 }

@@ -25,10 +25,14 @@ const CONNECT_TIMEOUT_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 
 export class ProxyPool {
-  constructor(
-    readonly entries: ProxyEntry[],
-    readonly removed: Array<{ raw: string; reason: string }> = [],
-  ) {}
+  // 注意：不用 TS 参数属性（Node strip-types 模式不支持）
+  readonly entries: ProxyEntry[];
+  readonly removed: Array<{ raw: string; reason: string }>;
+
+  constructor(entries: ProxyEntry[], removed: Array<{ raw: string; reason: string }> = []) {
+    this.entries = entries;
+    this.removed = removed;
+  }
 
   get size(): number {
     return this.entries.length;
@@ -261,13 +265,18 @@ async function encodeBody(body: BodyInit | null | undefined): Promise<Uint8Array
   return new Uint8Array(await new Response(body).arrayBuffer());
 }
 
-/** 管理端点用：测试单个代理连通性（对 Gemini API 发起 GET 探测） */
-export async function testProxy(proxyUrl: string): Promise<{ ok: boolean; latency_ms: number; error?: string }> {
+/** 管理端点/健康巡检用：测试单个代理连通性（对 Gemini API 发起 GET 探测） */
+export async function testProxy(proxyUrl: string, timeoutMs = 10_000): Promise<{ ok: boolean; latency_ms: number; error?: string }> {
   const p = parseProxyUrl(proxyUrl);
   if (!p) return { ok: false, latency_ms: 0, error: "invalid proxy url" };
   const started = Date.now();
   try {
-    const resp = await viaProxy(p, "https://generativelanguage.googleapis.com/v1beta/models", { method: "GET" });
+    const resp = await viaProxy(
+      p,
+      "https://generativelanguage.googleapis.com/v1beta/models",
+      { method: "GET" },
+      AbortSignal.timeout(timeoutMs),
+    );
     await resp.body?.cancel();
     return { ok: resp.status < 500, latency_ms: Date.now() - started, error: resp.status >= 500 ? "HTTP " + resp.status : undefined };
   } catch (err) {
