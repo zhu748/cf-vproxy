@@ -23,10 +23,29 @@ export interface GenericIO {
 }
 
 export interface HandshakeResult {
-  /** 握手读取器（内部可能残留缓冲字节，必须继续复用，不能丢弃） */
+  /** 握手读取器（内部可能残留缓冲字节；startTls 后由调用方重建 TLS 层 reader） */
   reader: ByteBufReader;
-  /** 握手后的写入器（继续用它写 HTTP 请求） */
+  /** 握手写入器（仅握手期使用；startTls 前必须释放写锁，见 releaseHandshake） */
   writer: WritableStreamDefaultWriter<Uint8Array>;
+}
+
+/** 握手完成后释放全部流锁（读 + 写）。
+ *
+ * v1.9.0 修复：Workers 的 `sock.startTls()` 返回的 TLS socket **复用同一对流对象**。
+ * 旧版只释放了读锁（reader.release()），握手 writer 持有的写锁一直未释放，
+ * 导致升级后 `tlsSock.writable.getWriter()` 扗出
+ * "This WritableStream is currently locked to a writer"——
+ * **所有经代理的出站请求 100% 失败**（握手成功反而死在 TLS 写入上，握手失败的节点
+ * 反而报出真实错误）。现在 startTls 前读写锁全部释放。
+ */
+export function releaseHandshake(hs: HandshakeResult): void {
+  hs.reader.release();
+  try {
+    hs.writer.releaseLock();
+  } catch {
+    // 存在未完成写操作时 releaseLock 会拋错：保持锁不动，
+    // 后续 getWriter 的报错会让本节点按失败处理并接力下一个候选
+  }
 }
 
 /** SOCKS5 握手（RFC 1928 / 1929） */

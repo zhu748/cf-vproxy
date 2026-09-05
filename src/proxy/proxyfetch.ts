@@ -17,7 +17,7 @@ import {
   readFullBody,
   writeTunnelRequest,
 } from "./httpclient.ts";
-import { httpConnectHandshake, socks4Handshake, socks5Handshake } from "./tunnel.ts";
+import { httpConnectHandshake, releaseHandshake, socks4Handshake, socks5Handshake } from "./tunnel.ts";
 
 const SUB_CACHE_KEY = "proxy_cache";
 const MAX_PROXIES = 200;
@@ -244,7 +244,9 @@ async function viaProxyInner(
     closeQuietly(sock);
     throw err;
   }
-  void hs.reader.release();
+  // v1.9.0：释放读写双锁 —— startTls 返回的 TLS socket 复用同一对流对象，
+  // 握手 writer 的写锁不释放会让下面 tlsSock.writable.getWriter() 拗 "currently locked to a writer"
+  releaseHandshake(hs);
 
   // v1.6.0：startTls 抛错时同样关闭底层 socket（防泄漏）
   let tlsSock: Socket;

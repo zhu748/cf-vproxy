@@ -12,7 +12,7 @@
 import type { Env } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { resolveProxyPool, refreshSubscription, subscriptionCachedAt, testProxy } from "./proxy/proxyfetch.ts";
-import { recordProxySuccess, recordProxyFailure, flushHealthNow, ensureHealthLoaded, flushHealthIfDue, sweepDue, keepaliveDue, subscriptionDue } from "./racing.ts";
+import { recordProxySuccess, recordProxyFailure, flushHealthNow, ensureHealthLoaded, flushHealthIfDue, sweepDue, keepaliveDue, subscriptionDue, leastRecentlyTestedOrder, healthMapSnapshot } from "./racing.ts";
 import { flushMetrics } from "./metrics.ts";
 import { flushIfDue } from "./usage.ts";
 
@@ -51,7 +51,9 @@ export async function runHealthSweep(env: Env, cfg: Awaited<ReturnType<typeof lo
 
   const pool = await resolveProxyPool(env, cfg, () => {});
   await ensureHealthLoaded(env);
-  const entries = pool.entries.slice(0, batchSize);
+  // v1.9.0：「最久未测优先」选点 —— 大池子数轮巡检即可全池轮转覆盖
+  // （旧版固定 slice(0, batch)，头部 40 个全坏时后面节点永远探索不到）
+  const entries = leastRecentlyTestedOrder(pool.entries, healthMapSnapshot()).slice(0, batchSize);
 
   const results: SweepReport["results"] = [];
   let cursor = 0;

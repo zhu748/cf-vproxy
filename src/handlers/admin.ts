@@ -22,7 +22,7 @@ import { geminiBase } from "../upstream.ts";
 import { clearLogs, listLogs } from "../logs.ts";
 import { renderPanelHtml } from "./panel.ts";
 import type { VProxyConfig } from "../types.ts";
-import { allHealthRecords, averageLatency, ensureHealthLoaded, flushHealthNow, healthMapSnapshot, recordProxyFailure, recordProxySuccess, resetHealth, sanitizeRacingConfig } from "../racing.ts";
+import { allHealthRecords, averageLatency, ensureHealthLoaded, flushHealthNow, healthMapSnapshot, poolBreakerSnapshot, recordProxyFailure, recordProxySuccess, resetHealth, sanitizeRacingConfig } from "../racing.ts";
 import { getMetrics, renderPrometheus } from "../metrics.ts";
 import { getPromptDiagnostics, clearPromptDiagnostics } from "../promptpolicy.ts";
 import { runHealthSweep, LAST_SWEEP_KEY } from "../cron.ts";
@@ -169,7 +169,8 @@ export async function handleAdmin(
       health: allHealthRecords(),
       avg_latency_ms: Math.round(averageLatency(healthMapSnapshot(), now)),
       sticky,
-      _hint: "健康度为 isolate 内存 + KV 快照（20s 批量刷盘）；score 由成功率/延迟/连败/粘性综合计算",
+      pool_breaker: poolBreakerSnapshot(),
+      _hint: "健康度为 isolate 内存 + KV 快照（20s 批量刷盘）；score 由成功率/延迟/连败/粘性综合计算。pool_breaker.open=true 时代理池被熔断（Workers 平台 TLS 过隧道不可用 / 全池连败），请求自动回退直连",
     });
   }
 

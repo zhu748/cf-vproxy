@@ -4,6 +4,24 @@
 > 专为 Cloudflare Workers（免费计划即可）设计。转换层逻辑与原项目对齐，去掉了 reCAPTCHA 突破、
 > TLS 指纹伪装、mihomo 代理内核等 Workers 沙箱无法实现的部分。
 >
+> **v1.9.1 更新（代理池熔断 + 直连兜底：Workers 平台 TLS 过隧道的诚实适配）**：
+> ⚠️ **平台限制实锤**：经分步诊断验证（手工 TLS 字节双向透传正常、workerd `startTls()` 在
+> 已承载代理握手流量的 socket 上 100% 报 `TLS Handshake Failed.`，与代理质量/协议实现无关），
+> **Cloudflare Workers 的 runtime 无法在 SOCKS/HTTP 代理隧道上完成 TLS 升级** —— 即
+> 「经代理访问 HTTPS 上游」在 Workers 上平台级不可用（VPS/Node 上同代同代理池正常）。
+> 因此 v1.9.1 给出适配而非死磕：
+> ① **代理池熔断器**：全池失败（或错误聚合命中平台 TLS 签名）时立即打开熔断，后续请求
+> 自动回退直连 fetch（不再「配了订阅就全站 500」）；熔断状态随健康快照持久化 KV，
+> 跨 isolate 共享，冷 isolate 首个请求即跳过死代理池；10 分钟冷却后自动半开重探
+> （平台修复或换可用代理时自动恢复）；
+> ② **巡检选点改为「最久未测优先」轮转**：修复大池子只反复测头部节点、后 160 个
+> 永远不被探索的问题；
+> ③ **startTls 前释放握手读写双锁**（旧版持锁会让 TLS 升级卡死 → 线上「Stream was cancelled」
+> 假超时）；`/admin/health` 新增 `pool_breaker` 字段实时可见；
+> ④ 地区封锁（`User location is not supported`）的正解：**Node 中转**（仓库自带 `relay/`，同 key
+> 同订阅实测 200）或 **Smart Placement**（wrangler.jsonc 已开启 `placement: smart`，把 Worker
+> 执行点迁到 Google 附近），详见「注意事项」第 3 条。
+>
 > **v1.8.0 更新（数据保护 + 协议感知错误 + 配额节流）**：
 > ① **修复管理端测速清空 KV 健康记录的破坏性 bug**——`/admin/proxies/test-all`、`/admin/proxy/test`
 > 在冷启动 isolate 上直接测速，会把 KV 健康快照覆盖成"仅含本次测速节点"，其余节点的历史健康度
@@ -104,6 +122,7 @@ generativelanguage.googleapis.com  （Gemini 官方 API，你的单个 API Key�
 | **协议感知错误** | **v1.8.0**：401/403/404/413/503/500 按请求路径返回各协议原生错误结构 —— Anthropic 客户端收到 `{type:"error", error:{type,...}}`、Gemini 客户端收到 `{error:{code,status,...}}`、OpenAI 客户端收到 `{error:{message,type,code}}`；繁忙 503 附 `Retry-After` |
 | **健康数据保护** | **v1.8.0**：管理端测速/健康查询先从 KV 恢复快照再写入 —— 修复冷启动 isolate 直接测速会清空其余节点历史健康度的破坏性 bug；客户端 Key 常量时间比对 |
 | **Cron 配额节流** | **v1.8.0**：订阅刷新按 `subscription_refresh_minutes` 判新鲜度（此前每跳无条件拉取+写 KV）；每跳顺手刷用量/健康度/指标统计 |
+| **代理池熔断** | **v1.9.1**：全池失败或命中平台 TLS 签名时立即熔断并回退直连（状态持久化 KV 跨 isolate 共享，10 分钟半开自愈）—— 配置订阅不再导致全站 500 |
 
 | 对话能力 | 纯文本、图片输入（base64 / URL / data URI）、工具调用（function calling 双向转换，含流式增量）、**n 多候选**（非流式 `n>1` 并发 n 次上游请求合并 choices，受 max_n 上限保护） |
 | **官方模型表** | **v1.4.0**：内置表为官方 ListModels 实拉数据（构建时生成，含 54 个模型的官方元数据）；运行时在面板「模型」页一键 **从官方重新拉取**（用当前上游 Key 调官方接口，自动分页、代理适配，KV 持久化立即生效），可一键恢复内置表；`/v1/models`、`/v1beta/models`、模型校验均动态跟随 |
@@ -432,8 +451,21 @@ curl "$BASE/v1/messages" \
 
 1. **CPU 限额**：免费计划 10ms CPU/请求。普通对话/流式转换占用极低；若频繁超限（503），升级 $5/月（30s CPU）。
 2. **KV 写入额度**：免费 1000 写/天。用量统计已做 25 秒批量合并，正常个人使用远够；流量大时可调大 `FLUSH_INTERVAL_MS`（`src/usage.ts`）。
-3. **代理协议**：支持 SOCKS4/4a、SOCKS5、HTTP CONNECT。**`https://` 代理在 Workers 上不可用**（startTls 无法 TLS-in-TLS）——
-   配置保存、代理池构建、订阅解析三个入口都会自动剔除并注明原因；vmess/vless/trojan/ss 等同样自动剔除（订阅刷新返回 `skipped_unsupported` 计数）。
+3. **代理协议与平台限制（重要）**：支持 SOCKS4/4a、SOCKS5、HTTP CONNECT。**`https://` 代理在 Workers 上不可用**
+   （startTls 无法 TLS-in-TLS）——配置保存、代理池构建、订阅解析三个入口都会自动剔除并注明原因；
+   vmess/vless/trojan/ss 等同样自动剔除（订阅刷新返回 `skipped_unsupported` 计数）。
+   **更根本的限制（v1.9.1 实测实锤）**：Workers runtime 的 `startTls()` 无法在已承载代理握手流量的
+   socket 上完成 TLS 升级（100% 报 `TLS Handshake Failed.`，与代理质量无关；同一批代理在
+   VPS/Node 上完全正常）——即 **经代理访问 HTTPS 上游（Gemini API）在 Workers 上平台级不可用**。
+   代理池因此触发熔断后，所有请求自动回退**直连**。若直连被 Google 地区封锁
+   （`User location is not supported`），可选方案：
+   - **Node 中转（推荐，仓库自带）**：`relay/` 目录 —— 零依赖单文件 Node 服务（Render/Railway/
+     fly.io/VPS 均可跑），代理池 + TLS 过隧道在 Node 上无平台限制，本机实测同 key 同订阅返回 200；
+     部署后面板把 `gemini_base_url` 指向 `https://your-relay.onrender.com/v1beta` 即可（详见 `relay/README.md`）；
+   - **Smart Placement**（已内置开启）：执行点迁到 Google 附近，出口换制式后可能解除封锁，
+     需要少量真实流量供 Cloudflare 画像后生效；注意 Google 对数据中心 IP 段还有配额压制
+     （`free_tier_requests` 限额极低），直连路线即使过了地区门也容易被限流；
+   - 或继续用原项目 vertex-master 的 VPS 部署（代理链路在 Node 上无此限制）。
 4. **流式超时**：Workers 对单个请求总时长有限制（免费约 30s CPU 但墙钟时间流式通常可维持数分钟）；超长流式若被掐断，重试即可。
 5. **单连接并发**：竞速开启时单请求最多 `max_concurrent` 条在飞 socket（默认 3，限额 6 条/请求）；关闭竞速时同时只用 1 条。
 6. **安全提示**：`/admin/*` 务必设置强 `ADMIN_TOKEN`；面板 HTML 本身不含敏感数据（token 登录后才拉取），但建议不要把 Worker 域名公开传播。

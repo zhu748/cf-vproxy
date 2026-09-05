@@ -14,11 +14,23 @@
   "kv_namespaces": [
     {
       "binding": "VPROXY_KV",
-      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+      "id": "8e66284fae7b498baf84bd8c7f769963"
     }
+  ],
+  // 自定义域名（Cloudflare 会自动为 hjm.051246.xyz 创建 DNS 记录与证书）
+  "routes": [
+    { "pattern": "hjm.051246.xyz", "custom_domain": true }
   ],
   // 非敏感配置可以放 vars（敏感的一律用 `wrangler secret put`）
   "vars": {},
+  // v1.9.0：Smart Placement —— 把 Worker 执行位置迁移到后端（generativelanguage.googleapis.com）
+  // 附近运行。对「客户端在被 Google 地理封锁的地区（如中国大陆/香港）」的部署尤其关键：
+  // 没有它，Worker 在离客户端最近的 PoP（往往是 HKG）执行，出口 IP 被 Google 以
+  // "User location is not supported" 拒绝；开启后执行点靠近 Google（美国），
+  // fetch 出口不再被拦。需要少量真实流量供 Cloudflare 完成画像后生效。
+  "placement": {
+    "mode": "smart"
+  },
   // Cron Triggers（免费计划可用）：驱动定时健康巡检 / 订阅差异更新 / keepalive 保活。
   // 默认每 15 分钟一跳（对齐原项目巡检间隔）；实际节奏由面板里的 interval_minutes /
   // keepalive_interval 控制（KV 时间戳判重，cron 只负责心跳）。

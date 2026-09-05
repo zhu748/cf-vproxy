@@ -14,11 +14,22 @@
 //
 // 关闭竞速时退回「健康分排序 + 轮换 + 故障接力」的顺序模式（rotateUpstream）。
 import type { Env } from "../config.ts";
-import { DEFAULT_RACING, retryDelayMs, shouldRetryDirect, type RacingConfig } from "../racing.ts";
+import {
+  DEFAULT_RACING,
+  PLATFORM_TLS_FAILURE_SIGNATURE,
+  breakerOnPoolFailure,
+  breakerOnPoolSuccess,
+  poolBreakerIsOpen,
+  poolBreakerSnapshot,
+  retryDelayMs,
+  shouldRetryDirect,
+  type RacingConfig,
+} from "../racing.ts";
 import {
   averageLatency,
   ensureHealthLoaded,
   flushHealthIfDue,
+  flushHealthNow,
   healthMapSnapshot,
   healthScore,
   isCooling,
@@ -340,12 +351,30 @@ export async function raceUpstream(
 
 // ---------- 统一出站入口 ----------
 
+/** 直连 fetch（429/408/425/5xx 按 Retry-After 退避重试一次 —— v1.6.0 语义） */
+async function directFetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+  let resp = await fetch(url, init);
+  if (shouldRetryDirect(resp.status)) {
+    const delay = retryDelayMs(resp.headers.get("retry-after"));
+    void resp.body?.cancel().catch(() => {});
+    await sleep(delay);
+    resp = await fetch(url, init);
+  }
+  return resp;
+}
+
+/** 熔断器状态（racing.ts 持有：isolate 内存 + KV 快照同步，跨 isolate 共享） */
+export { poolBreakerSnapshot };
+
 /**
  * 统一出站 fetch：
- *   - 无代理池 → 直连（v1.6.0：429/408/425/5xx 按上游 Retry-After 退避后重试一次，
- *     对齐代理模式的节点内重试语义 —— 此前直连模式瞬时错误直接透传给客户端）；
+ *   - 无代理池 / 熔断打开 → 直连（429/408/425/5xx 退避重试一次）；
  *   - 竞速关闭或池中仅 1 节点 → 健康排序轮换 + 故障接力（rotateUpstream）；
- *   - 竞速开启 → 对冲竞速（raceUpstream）。
+ *   - 竞速开启 → 对冲竞速（raceUpstream）；
+ *   - v1.9.1：全池失败不再直接报错 —— 记入熔断器并兜底直连一次
+ *     （Workers 平台 startTls 与代理隧道不兼容时保命；原项目 VPS 语义不受影响，
+ *      因为 VPS 上代理池可用时本分支不会触发）。错误聚合串命中平台 TLS 签名时
+ *     立即打开熔断并立即落盘 KV（其他 isolate 下一个请求即跳过死代理池）。
  * 健康度快照冷启动恢复只发生一次；请求结束后按需批量刷盘 KV。
  */
 export async function dispatchUpstream(
@@ -358,22 +387,36 @@ export async function dispatchUpstream(
 ): Promise<UpstreamResult> {
   await ensureHealthLoaded(env);
   const rc = racing ?? DEFAULT_RACING;
-  if (!pool || pool.size === 0) {
-    let resp = await fetch(url, init);
-    if (shouldRetryDirect(resp.status)) {
-      const delay = retryDelayMs(resp.headers.get("retry-after"));
-      void resp.body?.cancel().catch(() => {});
-      await sleep(delay);
-      resp = await fetch(url, init);
-    }
-    return { response: resp, via: "direct" };
+  const now = Date.now();
+  const hasPool = !!pool && pool.size > 0;
+  const bypassPool = !hasPool || poolBreakerIsOpen(poolBreakerSnapshot(), now);
+  if (bypassPool) {
+    const via = hasPool ? "direct(pool-breaker-open)" : "direct";
+    const resp = await directFetchWithRetry(url, init);
+    return { response: resp, via };
   }
   let result: UpstreamResult;
-  if (!rc.enabled || pool.size === 1) {
-    result = await rotateUpstream(url, init, pool, rc.node_retry);
-  } else {
-    result = await raceUpstream(url, init, pool, rc, waitUntil);
+  try {
+    if (!rc.enabled || pool!.size === 1) {
+      result = await rotateUpstream(url, init, pool!, rc.node_retry);
+    } else {
+      result = await raceUpstream(url, init, pool!, rc, waitUntil);
+    }
+  } catch (err) {
+    // v1.9.1：全池失败 → 熔断计数（命中平台 TLS 签名则立即打开）+ 直连兜底
+    const msg = err instanceof Error ? err.message : String(err);
+    const signature = PLATFORM_TLS_FAILURE_SIGNATURE.test(msg);
+    const opened = breakerOnPoolFailure(signature);
+    if (opened) {
+      console.warn("[upstream] proxy pool exhausted (" + (signature ? "platform TLS-over-tunnel signature" : "consecutive failures") + ") — circuit breaker OPEN, direct fallback for " + "10" + "min. Last error: " + msg.slice(0, 200));
+      // 立即落盘：其他 isolate 的下一个请求直接跳过死代理池（熔断打开是罕见事件，≤1次/10分钟，无写放大）
+      waitUntil(flushHealthNow(env));
+    }
+    waitUntil(flushHealthIfDue(env));
+    const resp = await directFetchWithRetry(url, init);
+    return { response: resp, via: "direct(pool-fallback)" };
   }
+  breakerOnPoolSuccess();
   waitUntil(flushHealthIfDue(env));
   return result;
 }

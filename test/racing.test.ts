@@ -8,6 +8,7 @@ import {
   emptyHealth,
   healthScore,
   isCooling,
+  leastRecentlyTestedOrder,
   selectCandidates,
   sanitizeRacingConfig,
   type ProxyHealth,
@@ -171,4 +172,38 @@ test("健康度写入路径：success/fail/ratelimit 的独立语义（通过健
   const h1 = mkHealth({ success: 5, fail: 0, last_success_at: SEC, avg_ms: 100 });
   const h2 = mkHealth({ success: 5, fail: 0, last_success_at: SEC, avg_ms: 100, rate_limit_count: 3, consec_fail: 1 });
   assert.ok(healthScore(h1, NOW) > healthScore(h2, NOW));
+});
+
+// ---------- v1.9.0：巡检「最久未测优先」轮转 ----------
+
+test("v1.9.0: leastRecentlyTestedOrder 未测试节点最优先，其次按最久未测升序", () => {
+  const health = new Map<string, ProxyHealth>();
+  // head1/head2 是池子头部节点（旧版 slice(0,batch) 永远只测它们），已有失败记录
+  health.set("head1", mkHealth({ fail: 3, last_fail_at: SEC - 100 }));
+  health.set("head2", mkHealth({ fail: 2, last_fail_at: SEC - 50 }));
+  // mid：较久之前测过（成功）
+  health.set("mid", mkHealth({ success: 1, last_success_at: SEC - 3600 }));
+  // tail1/tail2：从未测试（池子尾部节点）
+  const entries = ["head1", "head2", "mid", "tail1", "tail2"].map((raw) => ({ raw }));
+
+  const order = leastRecentlyTestedOrder(entries, health).map((e) => e.raw);
+  // 未测试（=0）最优先且保持池子原顺序；mid（最久已测）随后；最近测试时间离现在更近的排最后
+  // （head1 = 100s 前测试，head2 = 50s 前测试 → head1 更久未测，排 head2 之前）
+  assert.deepEqual(order, ["tail1", "tail2", "mid", "head1", "head2"]);
+});
+
+test("v1.9.0: leastRecentlyTestedOrder 全部未测试时保持原顺序（稳定排序）", () => {
+  const entries = ["p1", "p2", "p3", "p4"].map((raw) => ({ raw }));
+  const order = leastRecentlyTestedOrder(entries, new Map()).map((e) => e.raw);
+  assert.deepEqual(order, ["p1", "p2", "p3", "p4"]);
+});
+
+test("v1.9.0: leastRecentlyTestedOrder 取 max(last_success_at, last_fail_at) 判定最近测试", () => {
+  const health = new Map<string, ProxyHealth>();
+  // a：3 小时前失败、1 小时前成功 → 最近测试 = 1 小时前
+  health.set("a", mkHealth({ last_fail_at: SEC - 3 * 3600, last_success_at: SEC - 3600 }));
+  // b：2 小时前失败、从未成功 → 最近测试 = 2 小时前（更久 → 排更前）
+  health.set("b", mkHealth({ last_fail_at: SEC - 2 * 3600 }));
+  const entries = ["a", "b"].map((raw) => ({ raw }));
+  assert.deepEqual(leastRecentlyTestedOrder(entries, health).map((e) => e.raw), ["b", "a"]);
 });

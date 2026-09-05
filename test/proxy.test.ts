@@ -23,6 +23,12 @@ import {
   parseResponseHeadBlock,
   readFullBody,
 } from "../src/proxy/httpclient.ts";
+import {
+  httpConnectHandshake,
+  releaseHandshake,
+  socks4Handshake,
+  socks5Handshake,
+} from "../src/proxy/tunnel.ts";
 
 // ===== 工具 =====
 
@@ -367,3 +373,71 @@ async function readWholeStream(s: ReadableStream<Uint8Array>): Promise<Uint8Arra
   }
   return concatBytes(parts);
 }
+
+// ===== v1.9.0 回归：startTls 复用同一对流对象，握手后必须读写双解锁 =====
+//
+// Workers 运行时的 sock.startTls() 返回的 TLS socket 复用同一对 readable/writable 流对象。
+// 若握手 writer 的写锁未释放，升级后 tlsSock.writable.getWriter() 会抛
+// "This WritableStream is currently locked to a writer"（线上bug：所有代理出站 100% 失败）。
+// 以下测试用脚本化应答模拟三种代理握手，验证：握手后流确实处于锁定态（复现bug条件）
+// → releaseHandshake 后读写锁均可用（模拟 startTls 后重新 getWriter/getReader）。
+
+function makeMockIO(replies: Uint8Array[]): {
+  io: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
+  written: Uint8Array[];
+} {
+  const written: Uint8Array[] = [];
+  return {
+    io: { readable: streamFromChunks(replies), writable: new WritableStream<Uint8Array>({ write(c) { written.push(c); } }) },
+    written,
+  };
+}
+
+test("v1.9.0: socks5 握手后流被锁，releaseHandshake 后读写均可用（startTls 复用流对象语义）", async () => {
+  const proxy = parseProxyUrl("socks5://1.2.3.4:1080")!;
+  const replies = [new Uint8Array([5, 0]), new Uint8Array([5, 0, 0, 1, 0, 0, 0, 0, 0, 0])];
+  const { io, written } = makeMockIO(replies);
+  const hs = await socks5Handshake(io, proxy, "generativelanguage.googleapis.com", 443);
+
+  // 握手确实发生了出站写入
+  assert.ok(written.length >= 2);
+  // 复现 bug 条件：握手 writer 持有写锁、ByteBufReader 持有读锁
+  assert.throws(() => io.writable.getWriter(), /locked/i);
+  assert.throws(() => io.readable.getReader(), /locked/i);
+
+  // 修复：读写双解锁后，模拟 startTls 后重新获取读写器不再抛错
+  releaseHandshake(hs);
+  const w = io.writable.getWriter();
+  const r = io.readable.getReader();
+  assert.ok(w instanceof WritableStreamDefaultWriter);
+  assert.ok(r instanceof ReadableStreamDefaultReader);
+  w.releaseLock();
+  r.releaseLock();
+});
+
+test("v1.9.0: socks4 握手后 releaseHandshake 双解锁", async () => {
+  const proxy = parseProxyUrl("socks4://5.6.7.8:5678")!;
+  const replies = [new Uint8Array([0, 0x5a, 0, 0, 0, 0, 0, 0])];
+  const { io } = makeMockIO(replies);
+  const hs = await socks4Handshake(io, proxy, "generativelanguage.googleapis.com", 443);
+  assert.throws(() => io.writable.getWriter(), /locked/i);
+  releaseHandshake(hs);
+  const w = io.writable.getWriter();
+  const r = io.readable.getReader();
+  w.releaseLock();
+  r.releaseLock();
+});
+
+test("v1.9.0: http CONNECT 握手后 releaseHandshake 双解锁", async () => {
+  const proxy = parseProxyUrl("http://user:pass@9.9.9.9:8080")!;
+  const replies = [enc("HTTP/1.1 200 Connection established\r\n\r\n")];
+  const { io, written } = makeMockIO(replies);
+  const hs = await httpConnectHandshake(io, proxy, "generativelanguage.googleapis.com", 443);
+  assert.ok(written.length >= 1);
+  assert.throws(() => io.writable.getWriter(), /locked/i);
+  releaseHandshake(hs);
+  const w = io.writable.getWriter();
+  const r = io.readable.getReader();
+  w.releaseLock();
+  r.releaseLock();
+});

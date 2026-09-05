@@ -274,6 +274,93 @@ export function averageLatency(healthMap: Map<string, ProxyHealth>, now: number)
   return count === 0 ? 500 : sum / count;
 }
 
+/** v1.9.0：巡检选点 —— 「最久未测优先」轮转。
+ * 旧版固定 `slice(0, batch)` 只反复测池子头部节点：200 节点的池子后 160 个
+ * 永远不会被巡检探索（若头部 40 个全坏，巡检就永远因在死节点上）。
+ * 现在按 max(last_success_at, last_fail_at) 升序排（未测试 = 0 最优先），
+ * 数轮巡检即可全池轮转覆盖；同时间戳保持池子原顺序（稳定排序）。 */
+export function leastRecentlyTestedOrder<T extends CandidateLike>(
+  entries: T[],
+  healthMap: Map<string, ProxyHealth>,
+): T[] {
+  const lastTested = (e: T): number => {
+    const h = healthMap.get(e.raw);
+    if (!h) return 0;
+    return Math.max(h.last_success_at, h.last_fail_at);
+  };
+  return [...entries].sort((a, b) => lastTested(a) - lastTested(b));
+}
+
+// ---------- 代理池平台级熔断（v1.9.1，纯逻辑） ----------
+
+/**
+ * Workers 平台适配：cloudflare:sockets 的 startTls() 无法在已承载代理握手流量的
+ * socket 上完成 TLS 升级（workerd runtime 限制，100% 复现 "TLS Handshake Failed."，
+ * 与代理质量/协议实现无关 —— 隧道双向透传原始 TLS 字节正常）。因此代理池在
+ * Workers 上可能「整体不可用」：若沿用原项目语义（全池失败 → 直接报错），
+ * 配置了订阅的部署会全站瘫痪。熔断器在全池连续失败 N 次后打开，后续请求
+ * 直接走直连 fetch（保命），冷却窗口过后自动半开重试代理池 —— 若平台修复
+ * 或用户换到可用代理，行为自动恢复。
+ */
+export interface PoolBreakerState {
+  /** 全池连续失败次数（任一代理成功即清零） */
+  consecutivePoolFailures: number;
+  /** 熔断打开至（epoch ms）；0 = 关闭 */
+  openUntil: number;
+}
+
+export const POOL_BREAKER_THRESHOLD = 3;
+export const POOL_BREAKER_COOLDOWN_MS = 10 * 60_000;
+
+export const CLOSED_POOL_BREAKER: PoolBreakerState = { consecutivePoolFailures: 0, openUntil: 0 };
+
+/** 熔断器当前是否处于打开（跳过代理池）状态 */
+export function poolBreakerIsOpen(b: PoolBreakerState, now: number): boolean {
+  return b.openUntil > now;
+}
+
+/** 一次「全池尝试」的结果回写：成功清零；失败累计并在达到阈值时打开熔断。
+ * v1.9.1：platformTlsSignature=true（本次全池失败的错误中含 workerd 平台签名
+ * 「TLS Handshake Failed」，即 startTls 无法在代理隧道上完成 TLS 升级）时
+ * 立即打开熔断，不等阈值 —— 冷 isolate 的首个请求就跳过代理池，免烧 2–5 秒。 */
+export function poolBreakerOnOutcome(
+  b: PoolBreakerState,
+  poolSucceeded: boolean,
+  now: number,
+  platformTlsSignature = false,
+): PoolBreakerState {
+  if (poolSucceeded) return CLOSED_POOL_BREAKER;
+  if (platformTlsSignature) {
+    return { consecutivePoolFailures: Math.max(b.consecutivePoolFailures + 1, POOL_BREAKER_THRESHOLD), openUntil: now + POOL_BREAKER_COOLDOWN_MS };
+  }
+  const failures = b.consecutivePoolFailures + 1;
+  const openUntil = failures >= POOL_BREAKER_THRESHOLD ? now + POOL_BREAKER_COOLDOWN_MS : b.openUntil;
+  return { consecutivePoolFailures: failures, openUntil };
+}
+
+/** 错误聚合串中是否命中 workerd 平台级代理隧道 TLS 失败签名 */
+export const PLATFORM_TLS_FAILURE_SIGNATURE = /TLS Handshake Failed/i;
+
+// 熔断运行时状态（isolate 内存 + KV 快照同步，跨 isolate 共享；详见下方 KV 快照段）
+let breakerMem: PoolBreakerState = CLOSED_POOL_BREAKER;
+
+/** 面板/管理端读取熔断器当前状态（/admin/health 暴露） */
+export function poolBreakerSnapshot(): PoolBreakerState & { open: boolean } {
+  return { ...breakerMem, open: poolBreakerIsOpen(breakerMem, Date.now()) };
+}
+
+/** 全池成功：清零并标记待刷盘 */
+export function breakerOnPoolSuccess(): void {
+  breakerMem = CLOSED_POOL_BREAKER;
+  touchPending();
+}
+
+/** 全池失败：按结果/签名更新熔断器；返回是否处于「打开」状态 */
+export function breakerOnPoolFailure(platformTlsSignature: boolean): boolean {
+  breakerMem = poolBreakerOnOutcome(breakerMem, false, Date.now(), platformTlsSignature);
+  return poolBreakerIsOpen(breakerMem, Date.now());
+}
+
 // ---------- 直连（无代理池）模式退避重试（v1.6.0） ----------
 
 /**
@@ -387,6 +474,8 @@ export function allHealthRecords(): Record<string, ProxyHealth> {
 interface HealthSnapshot {
   at: number; // epoch 秒
   nodes: Record<string, ProxyHealth>;
+  /** v1.9.1：代理池熔断器（跨 isolate 共享；缺失时视为关闭，首个请求重新学习） */
+  breaker?: PoolBreakerState;
 }
 
 /** 冷启动恢复：从 KV 读取快照（24 小时内有效；内存已有数据时以内存为准） */
@@ -402,6 +491,11 @@ export async function ensureHealthLoaded(env: Env): Promise<void> {
       if (!h || typeof h !== "object" || healthMem.has(uri)) continue;
       if (healthMem.size >= HEALTH_MAX_NODES) break;
       healthMem.set(uri, { ...emptyHealth(), ...h });
+    }
+    const b = snap.breaker;
+    if (b && typeof b === "object" && Number.isFinite(b.consecutivePoolFailures) && Number.isFinite(b.openUntil)) {
+      // v1.9.1：恢复其他 isolate 写入的熔断状态（冷 isolate 首个请求即跳过死代理池）
+      breakerMem = { consecutivePoolFailures: Math.max(0, b.consecutivePoolFailures), openUntil: Math.max(0, b.openUntil) };
     }
   } catch {
     // KV 读失败不影响请求
@@ -420,8 +514,9 @@ export async function flushHealthNow(env: Env): Promise<void> {
   if (healthFlushing) return;
   healthFlushing = true;
   try {
-    if (healthMem.size === 0) return;
-    const snap: HealthSnapshot = { at: Math.floor(Date.now() / 1000), nodes: {} };
+    const breakerClosed = breakerMem.consecutivePoolFailures === 0 && breakerMem.openUntil === 0;
+    if (healthMem.size === 0 && breakerClosed) return;
+    const snap: HealthSnapshot = { at: Math.floor(Date.now() / 1000), nodes: {}, breaker: breakerMem };
     for (const [uri, h] of healthMem.entries()) snap.nodes[uri] = h;
     await env.VPROXY_KV.put(HEALTH_KEY, JSON.stringify(snap));
     oldestPendingAt = 0;
