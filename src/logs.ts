@@ -32,11 +32,11 @@ export function clearLogs(): void {
   ring.length = 0;
 }
 
-/** 从路径推断协议分类 */
+/** 从路径推断协议分类（v1.7.0：补齐 /v1/responses、/v1/audio、/v1/images —— 归入 openai 协议家族，此前面板日志显示 other） */
 export function protocolOf(path: string): string {
   if (path.startsWith("/admin")) return "admin";
-  if (path.startsWith("/v1/chat")) return "openai";
-  if (path.startsWith("/v1/models")) return "openai";
+  if (path.startsWith("/v1/chat") || path.startsWith("/v1/models")) return "openai";
+  if (path.startsWith("/v1/responses") || path.startsWith("/v1/audio") || path.startsWith("/v1/images")) return "openai";
   if (path.startsWith("/v1/messages")) return "anthropic";
   if (path.startsWith("/v1beta")) return "gemini";
   if (path === "/" || path === "/healthz" || path === "/readyz") return "health";

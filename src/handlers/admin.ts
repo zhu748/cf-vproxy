@@ -14,8 +14,8 @@
 //   GET  /admin/health            节点健康度快照（竞速/接力依据，含竞速配置）
 //   POST /admin/health/reset      清空节点健康度
 //   POST /admin/proxies/test-all  并发全量测速（写入健康度，可用优先+延迟升序返回）
-import { invalidateConfigCache, loadConfig, saveConfig, type Env } from "../config.ts";
-import { json } from "../convert/common.ts";
+import { loadConfig, saveConfig, type Env } from "../config.ts";
+import { json, tokensEqual } from "../convert/common.ts";
 import { cleanProxyList } from "../proxy/frames.ts";
 import { activeSourceInfo, activeTable, builtinTable, classifyModels, clearDynamicModels, storeDynamicModels } from "../modellist.ts";
 import { geminiBase } from "../upstream.ts";
@@ -53,7 +53,7 @@ export async function handleAdmin(
   }
   const auth = req.headers.get("authorization") ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : new URL(req.url).searchParams.get("token") ?? "";
-  if (token !== envVars.ADMIN_TOKEN) {
+  if (!tokensEqual(token, envVars.ADMIN_TOKEN)) {
     return json({ error: "无效的管理 token" }, 401);
   }
 
@@ -96,7 +96,8 @@ export async function handleAdmin(
     if (body.racing !== undefined) next.racing = sanitizeRacingConfig(body.racing);
     const normalized = { ...next, proxies: next.proxies };
     await saveConfig(envVars, normalized);
-    invalidateConfigCache();
+    // v1.6.0：saveConfig 已同步刷新本 isolate 缓存，无需再 invalidate（旧代码会把刚写入的缓存清掉，
+    // 导致下个请求多读一次 KV）；其他 isolate 最多滞后 60s TTL。
     return json({
       ok: true,
       config: { ...normalized, gemini_key: maskKey(normalized.gemini_key) },

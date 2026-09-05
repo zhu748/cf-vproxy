@@ -22,7 +22,8 @@ import type { GPart, GResponse, ORequest, RInputItem, RRequest, RTool } from "..
 import { callGemini, finalizeGenerationConfig, mapUpstreamError, resolveModel, type HandlerCtx } from "../upstream.ts";
 import { adaptPrefill, PrefillEchoFilter } from "../prefill.ts";
 import { recordUsage, scheduleFlush } from "../usage.ts";
-import { geminiJsonChunks } from "./sse.ts";
+import { geminiJsonChunks, sseResponseFromGenerator } from "./sse.ts";
+import { isThoughtPart } from "../convert/common.ts";
 
 // ---------- 请求转换 ----------
 
@@ -340,6 +341,7 @@ export function geminiToResponsesEnvelope(
   for (const p of parts) {
     const t = partText(p);
     if (t !== undefined) {
+      if (isThoughtPart(p)) continue; // v1.7.0：思考摘要不混入 output_text（Responses 语义无对应块，丢弃）
       text += t;
       continue;
     }
@@ -455,6 +457,7 @@ export async function* geminiChunksToResponsesEvents(
     for (const p of parts as GPart[]) {
       const t = partText(p);
       if (t !== undefined) {
+        if (isThoughtPart(p)) continue; // v1.7.0：思考摘要不混入 output_text.delta
         const out = filter ? filter.feed(t) : t;
         if (!out) continue;
         if (!textOpen) {
@@ -652,35 +655,13 @@ export async function handleResponses(req: Request, ctx: HandlerCtx): Promise<Re
       lastUsage = u;
     },
   );
-  const encoder = new TextEncoder();
-  const upstreamRef = upstream;
-  const stream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const { value, done } = await events.next();
-        if (done) {
-          controller.close();
-          recordUsage(ctx.clientKey, resolved.model, lastUsage?.input_tokens ?? 0, lastUsage?.output_tokens ?? 0);
-          ctx.waitUntil(scheduleFlush(ctx.env));
-        } else {
-          controller.enqueue(encoder.encode(value));
-        }
-      } catch (e) {
-        void upstreamRef.body?.cancel().catch(() => {});
-        controller.error(e);
-      }
-    },
-    cancel() {
-      void upstreamRef.body?.cancel().catch(() => {});
-    },
-  });
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",
-    },
-  });
+  // v1.7.0：统一走 sseResponseFromGenerator（补 10s ping 保活；旧手写流长思考请求会被空闲超时掐断）
+  let usageRecorded = false;
+  const recordStreamUsage = () => {
+    if (usageRecorded) return;
+    usageRecorded = true;
+    recordUsage(ctx.clientKey, resolved.model, lastUsage?.input_tokens ?? 0, lastUsage?.output_tokens ?? 0);
+    ctx.waitUntil(scheduleFlush(ctx.env));
+  };
+  return sseResponseFromGenerator(events, upstream, recordStreamUsage);
 }

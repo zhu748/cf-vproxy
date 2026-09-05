@@ -24,6 +24,12 @@ const MAX_PROXIES = 200;
 const CONNECT_TIMEOUT_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 
+// v1.6.0：订阅缓存与代理池的 isolate 内存缓存 ——
+// 此前每个业务请求都读一次 KV 订阅缓存 + 全量重新解析/去重代理 URL（免费计划 10 万读/天的
+// 额度会被高频流量打爆，且每请求多一次 KV 往返延迟）。现在：
+//   - 订阅缓存命中后 30 秒内不再读 KV（KV 读失败时回退到内存旧值）；
+//   - ProxyPool 解析结果按「静态列表+订阅列表」拼串做键缓存，未变直接复用。
+
 export class ProxyPool {
   // 注意：不用 TS 参数属性（Node strip-types 模式不支持）
   readonly entries: ProxyEntry[];
@@ -104,11 +110,17 @@ export async function refreshSubscription(env: Env, url: string): Promise<SubCac
     }
     const cache: SubCache = { at: Date.now(), proxies, skipped };
     await env.VPROXY_KV.put(SUB_CACHE_KEY, JSON.stringify(cache));
+    subMem = { at: Date.now(), cache }; // 拉取成功同步刷新内存缓存
     return cache;
   } catch {
     return null;
   }
 }
+
+// 订阅内存缓存（30s TTL；KV 读失败时回退旧值）与代理池解析缓存
+const SUB_MEM_TTL_MS = 30_000;
+let subMem: { at: number; cache: SubCache } | null = null;
+let poolCache: { key: string; pool: ProxyPool } | null = null;
 
 export async function resolveProxyPool(
   env: Env,
@@ -116,34 +128,44 @@ export async function resolveProxyPool(
   waitUntil: (p: Promise<unknown>) => void,
 ): Promise<ProxyPool> {
   const staticList = [...cfg.proxies];
-  let subSkipped = 0;
   if (cfg.subscription) {
     const ttlMs = Math.max(5, cfg.subscription_refresh_minutes) * 60_000;
     let cache: SubCache | null = null;
-    try {
-      cache = (await env.VPROXY_KV.get(SUB_CACHE_KEY, "json")) as SubCache | null;
-    } catch {
-      cache = null;
+    const memFresh = subMem !== null && Date.now() - subMem.at < Math.min(SUB_MEM_TTL_MS, ttlMs);
+    if (memFresh) {
+      cache = subMem!.cache; // 命中内存缓存：不再读 KV
+    } else {
+      let kvReadOk = true;
+      try {
+        cache = (await env.VPROXY_KV.get(SUB_CACHE_KEY, "json")) as SubCache | null;
+      } catch {
+        cache = null;
+        kvReadOk = false;
+      }
+      if (cache) {
+        subMem = { at: Date.now(), cache };
+      } else if (!kvReadOk && subMem) {
+        cache = subMem.cache; // KV 读失败：回退内存旧值（可用性优先）
+      }
     }
     const fresh = cache && Date.now() - cache.at < ttlMs;
     if (!cache) {
       // 完全没有缓存：同步拉一次（首次请求略慢）
       const got = await refreshSubscription(env, cfg.subscription);
-      if (got) {
-        staticList.push(...got.proxies);
-        subSkipped = got.skipped;
-      }
+      if (got) staticList.push(...got.proxies);
     } else {
       staticList.push(...cache.proxies);
-      subSkipped = cache.skipped;
       if (!fresh) {
         // 过期：后台刷新，本次先用旧数据
         waitUntil(refreshSubscription(env, cfg.subscription));
       }
     }
   }
-  void subSkipped;
+  // 代理池解析缓存：列表未变时直接复用（省去每请求的 parse + 去重 + 剔除）
+  const poolKey = staticList.join("\n");
+  if (poolCache && poolCache.key === poolKey) return poolCache.pool;
   const pool = ProxyPool.fromStrings(staticList);
+  poolCache = { key: poolKey, pool };
   if (pool.removed.length > 0) {
     console.log("[proxy] auto-removed unsupported proxy links:", JSON.stringify(pool.removed));
   }
@@ -214,7 +236,14 @@ async function viaProxyInner(
   }
   void hs.reader.release();
 
-  const tlsSock = sock.startTls({ expectedServerHostname: targetHost });
+  // v1.6.0：startTls 抛错时同样关闭底层 socket（防泄漏）
+  let tlsSock: Socket;
+  try {
+    tlsSock = sock.startTls({ expectedServerHostname: targetHost });
+  } catch (err) {
+    closeQuietly(sock);
+    throw err;
+  }
   const onTlsAbort = () => closeQuietly(tlsSock);
   signal?.addEventListener("abort", onTlsAbort, { once: true });
   const writer = tlsSock.writable.getWriter();

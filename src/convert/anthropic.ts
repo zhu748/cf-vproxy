@@ -10,7 +10,7 @@ import type {
   GRequest,
   GResponse,
 } from "../types.ts";
-import { imageToInlineData, partFunctionCall, partInlineData, partText, randomId, textPart } from "./common.ts";
+import { imageToInlineData, isThoughtPart, partFunctionCall, partInlineData, partText, randomId, textPart } from "./common.ts";
 import { anthropicThinkingToConfig } from "../thinking.ts";
 import { applyClaudePromptPolicy, type ClaudePromptPolicy } from "../promptpolicy.ts";
 
@@ -193,14 +193,25 @@ function mapStopReason(finishReason: string | undefined, hasToolUse: boolean): s
   }
 }
 
+/** inlineData → markdown 文本（与 geminiToAnthropic 非流式行为一致；v1.7.0：流式/假流式补齐，此前图像模型经 Anthropic 端点流式输出为空） */
+function inlineMarkdown(inline: { mime_type?: string; data?: string }): string {
+  return "![image](data:" + (inline.mime_type || "image/png") + ";base64," + inline.data + ")";
+}
+
 export function geminiToAnthropic(g: GResponse, model: string, id: string): Record<string, unknown> {
   const cand = g.candidates?.[0];
   const parts = cand?.content?.parts ?? [];
   const content: Array<Record<string, unknown>> = [];
   for (const p of parts) {
     const t = partText(p);
-    if (t) {
-      content.push({ type: "text", text: t });
+    if (t !== undefined) {
+      // v1.7.0：思考摘要 → Claude 原生 thinking 块（不再混入正文；Anthropic 路径默认 includeThoughts=true，
+      // 旧实现会把 Gemini 内部思考当普通 text 发给 Claude Code 客户端）
+      if (isThoughtPart(p)) {
+        content.push({ type: "thinking", thinking: t, signature: "" });
+      } else {
+        content.push({ type: "text", text: t });
+      }
       continue;
     }
     const fc = partFunctionCall(p);
@@ -211,12 +222,11 @@ export function geminiToAnthropic(g: GResponse, model: string, id: string): Reco
     // 图像模型输出 → markdown data URI 文本块（Anthropic 无图像输出块类型）
     const inline = partInlineData(p);
     if (inline) {
-      content.push({
-        type: "text",
-        text: "![image](data:" + (inline.mime_type || "image/png") + ";base64," + inline.data + ")",
-      });
+      content.push({ type: "text", text: inlineMarkdown(inline) });
     }
   }
+  // v1.7.0：空 content（安全拒答等场景）补一个空 text 块 —— 部分 Anthropic 客户端对 content:[] 兼容性差
+  if (content.length === 0) content.push({ type: "text", text: "" });
   const hasToolUse = content.some((c) => c.type === "tool_use");
   const u = g.usageMetadata ?? {};
   const output = (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0);
@@ -236,7 +246,10 @@ export function geminiToAnthropic(g: GResponse, model: string, id: string): Reco
 
 /**
  * Gemini SSE chunk 流 → Anthropic SSE 事件流。
- * 事件序列：message_start → (text / tool_use 块 start+delta+stop)* → message_delta → message_stop
+ * 事件序列：message_start → (thinking 块 / text 块 / tool_use 块 start+delta+stop)*
+ *   → message_delta → message_stop
+ * v1.7.0：thought parts → Claude thinking 块（thinking_delta）；inlineData → markdown
+ * 文本块（图像模型流式输出不再丢失）；空流收尾补一个空 text 块。
  */
 export async function* geminiSseToAnthropicEvents(
   geminiChunks: AsyncIterable<GResponse>,
@@ -245,7 +258,7 @@ export async function* geminiSseToAnthropicEvents(
   onUsage?: (inputTokens: number, outputTokens: number) => void,
 ): AsyncGenerator<string> {
   let blockIndex = -1;
-  let textOpen = false;
+  let blockKind: "text" | "thinking" | null = null;
   let lastOutputTokens = 0;
   let inputTokens = 0;
   let stopReason: string | null = null;
@@ -267,15 +280,36 @@ export async function* geminiSseToAnthropicEvents(
     },
   });
 
-  const openTextBlock = () => {
+  const closeBlock = function* (): Generator<string> {
+    if (blockKind === null) return;
+    if (blockKind === "thinking") {
+      // 空 signature（客户端回传时由输入侧忽略，不影响 Gemini 转换）
+      yield ev("content_block_delta", {
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: { type: "signature_delta", signature: "" },
+      });
+    }
+    yield ev("content_block_stop", { type: "content_block_stop", index: blockIndex });
+    blockKind = null;
+  };
+
+  const openBlock = (kind: "text" | "thinking") => {
     blockIndex += 1;
-    textOpen = true;
+    blockKind = kind;
     return ev("content_block_start", {
       type: "content_block_start",
       index: blockIndex,
-      content_block: { type: "text", text: "" },
+      content_block: kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" },
     });
   };
+
+  const emitTextDelta = (t: string) =>
+    ev("content_block_delta", {
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "text_delta", text: t },
+    });
 
   for await (const g of geminiChunks) {
     if (g.usageMetadata) {
@@ -288,18 +322,21 @@ export async function* geminiSseToAnthropicEvents(
     for (const p of parts) {
       const t = partText(p);
       const fc = partFunctionCall(p);
-      if (t) {
-        if (!textOpen) yield openTextBlock();
-        yield ev("content_block_delta", {
-          type: "content_block_delta",
-          index: blockIndex,
-          delta: { type: "text_delta", text: t },
-        });
-      } else if (fc) {
-        if (textOpen) {
-          yield ev("content_block_stop", { type: "content_block_stop", index: blockIndex });
-          textOpen = false;
+      if (t !== undefined) {
+        const thought = isThoughtPart(p);
+        if (blockKind !== (thought ? "thinking" : "text")) {
+          yield* closeBlock();
+          yield openBlock(thought ? "thinking" : "text");
         }
+        yield thought
+          ? ev("content_block_delta", {
+              type: "content_block_delta",
+              index: blockIndex,
+              delta: { type: "thinking_delta", thinking: t },
+            })
+          : emitTextDelta(t);
+      } else if (fc) {
+        yield* closeBlock();
         sawToolUse = true;
         blockIndex += 1;
         yield ev("content_block_start", {
@@ -313,14 +350,25 @@ export async function* geminiSseToAnthropicEvents(
           delta: { type: "input_json_delta", partial_json: JSON.stringify(fc.args ?? {}) },
         });
         yield ev("content_block_stop", { type: "content_block_stop", index: blockIndex });
+      } else {
+        const inline = partInlineData(p);
+        if (inline) {
+          if (blockKind !== "text") {
+            yield* closeBlock();
+            yield openBlock("text");
+          }
+          yield emitTextDelta(inlineMarkdown(inline));
+        }
       }
     }
     if (cand?.finishReason) stopReason = mapStopReason(cand.finishReason, sawToolUse);
   }
 
-  if (textOpen) {
-    yield ev("content_block_stop", { type: "content_block_stop", index: blockIndex });
+  if (blockKind === null) {
+    // v1.7.0：空流（安全拒答等）补一个空 text 块，避免部分客户端收到 0 个 content block
+    yield openBlock("text");
   }
+  yield* closeBlock();
   yield ev("message_delta", {
     type: "message_delta",
     delta: { stop_reason: stopReason ?? (sawToolUse ? "tool_use" : "end_turn"), stop_sequence: null },
@@ -358,34 +406,64 @@ export async function* fakeStreamAnthropicEvents(
     },
   });
 
-  // 与 geminiToAnthropic 相同的合并策略：所有 text part 合并为一个文本块
+  // 与 geminiToAnthropic 相同的合并策略：thought 聚合为单个 thinking 块、文本合并为一个
+  // 文本块、inlineData 转 markdown 文本（v1.7.0：对齐非流式行为，图像不再丢失）
   const cand = g.candidates?.[0];
   const parts = cand?.content?.parts ?? [];
   let text = "";
+  let reasoning = "";
   const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
   for (const p of parts) {
     const t = partText(p);
-    if (t) {
-      text += t;
+    if (t !== undefined) {
+      if (isThoughtPart(p)) reasoning += t;
+      else text += t;
       continue;
     }
     const fc = partFunctionCall(p);
-    if (fc) toolCalls.push({ name: fc.name, args: fc.args ?? {} });
+    if (fc) {
+      toolCalls.push({ name: fc.name, args: fc.args ?? {} });
+      continue;
+    }
+    const inline = partInlineData(p);
+    if (inline) text += inlineMarkdown(inline);
   }
 
   let blockIndex = -1;
-  if (text) {
+  if (reasoning) {
+    blockIndex += 1;
+    yield ev("content_block_start", {
+      type: "content_block_start",
+      index: blockIndex,
+      content_block: { type: "thinking", thinking: "" },
+    });
+    yield ev("content_block_delta", {
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "thinking_delta", thinking: reasoning },
+    });
+    yield ev("content_block_delta", {
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "signature_delta", signature: "" },
+    });
+    yield ev("content_block_stop", { type: "content_block_stop", index: blockIndex });
+  }
+  if (text || (blockIndex === -1 && toolCalls.length === 0)) {
+    // 有 thinking 无正文时也补一个空 text 块（对齐非流式空 content 兜底语义）；空响应至少一个块
     blockIndex += 1;
     yield ev("content_block_start", {
       type: "content_block_start",
       index: blockIndex,
       content_block: { type: "text", text: "" },
     });
-    yield ev("content_block_delta", {
-      type: "content_block_delta",
-      index: blockIndex,
-      delta: { type: "text_delta", text },
-    });
+    if (text) {
+      yield ev("content_block_delta", {
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: { type: "text_delta", text },
+      });
+    }
     yield ev("content_block_stop", { type: "content_block_stop", index: blockIndex });
   }
   const sawToolUse = toolCalls.length > 0;

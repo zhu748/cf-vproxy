@@ -1,4 +1,6 @@
 // Anthropic 协议处理器：POST /v1/messages + POST /v1/messages/count_tokens
+// v1.7.0：流式路径改用 sseResponseFromGenerator —— 补齐 10s ping 保活（长思考请求不再被
+//         空闲超时掐断）、客户端断开时取消上游（不再继续烧 token）、断开/异常时也记录 usage。
 import { errAnthropic, json, randomId } from "../convert/common.ts";
 import {
   anthropicToGemini,
@@ -9,7 +11,8 @@ import {
 import type { ARequest } from "../types.ts";
 import { callGemini, mapUpstreamError, resolveModel, type HandlerCtx } from "../upstream.ts";
 import { recordUsage, scheduleFlush } from "../usage.ts";
-import { geminiJsonChunks } from "./sse.ts";
+import { geminiJsonChunks, sseResponseFromGenerator } from "./sse.ts";
+import { countTokensCacheKey, countTokensWithCache } from "../counttokens.ts";
 
 export async function handleAnthropicMessages(req: Request, ctx: HandlerCtx): Promise<Response> {
   let areq: ARequest;
@@ -96,36 +99,18 @@ export async function handleAnthropicMessages(req: Request, ctx: HandlerCtx): Pr
     );
   }
 
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const { value, done } = await gen.next();
-        if (done) {
-          controller.close();
-          recordUsage(ctx.clientKey, resolved.model, usage?.input ?? 0, usage?.output ?? 0);
-          ctx.waitUntil(scheduleFlush(ctx.env));
-        } else {
-          controller.enqueue(encoder.encode(value));
-        }
-      } catch (e) {
-        controller.error(e);
-      }
-    },
-  });
-
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",
-    },
-  });
+  // v1.7.0：统一走 sseResponseFromGenerator（ping 保活 + 断开取消上游）
+  let usageRecorded = false;
+  const recordStreamUsage = () => {
+    if (usageRecorded) return;
+    usageRecorded = true;
+    recordUsage(ctx.clientKey, resolved.model, usage?.input ?? 0, usage?.output ?? 0);
+    ctx.waitUntil(scheduleFlush(ctx.env));
+  };
+  return sseResponseFromGenerator(gen, upstream, recordStreamUsage);
 }
 
-/** POST /v1/messages/count_tokens → Gemini :countTokens */
+/** POST /v1/messages/count_tokens → Gemini :countTokens（v1.6.0：接入 single-flight + LRU + TTL 缓存） */
 export async function handleAnthropicCountTokens(req: Request, ctx: HandlerCtx): Promise<Response> {
   let areq: ARequest;
   try {
@@ -146,19 +131,42 @@ export async function handleAnthropicCountTokens(req: Request, ctx: HandlerCtx):
     clientModel: areq.model,
     resolvedModel: resolved.model,
   });
-  let upstream: Response;
+  // 上游错误响应需原样透传给 mapUpstreamError：用带 Response 载体的异常从 loader 中抛出（不会被缓存）
   try {
-    upstream = await callGemini(ctx, resolved.model, "countTokens", JSON.stringify(greq));
-  } catch (e) {
-    return errAnthropic(503, "api_error", "upstream request failed: " + (e instanceof Error ? e.message : String(e)));
-  }
-  if (!upstream.ok) return await mapUpstreamError(upstream, "anthropic");
-  try {
-    const g = (await upstream.json()) as { totalTokens?: number };
-    recordUsage(ctx.clientKey, resolved.model, g.totalTokens ?? 0, 0);
+    const cacheKey = countTokensCacheKey(resolved.model, greq.contents);
+    const total = await countTokensWithCache(cacheKey, async () => {
+      let upstream: Response;
+      try {
+        upstream = await callGemini(ctx, resolved.model, "countTokens", JSON.stringify(greq));
+      } catch (e) {
+        throw new Error("upstream request failed: " + (e instanceof Error ? e.message : String(e)));
+      }
+      if (!upstream.ok) {
+        throw new UpstreamErrorCarrier(upstream);
+      }
+      try {
+        const g = (await upstream.json()) as { totalTokens?: number };
+        return g.totalTokens ?? 0;
+      } catch {
+        throw new Error("invalid upstream response");
+      }
+    });
+    recordUsage(ctx.clientKey, resolved.model, total, 0);
     ctx.waitUntil(scheduleFlush(ctx.env));
-    return json({ input_tokens: g.totalTokens ?? 0 });
-  } catch {
-    return errAnthropic(503, "api_error", "invalid upstream response");
+    return json({ input_tokens: total });
+  } catch (e) {
+    if (e instanceof UpstreamErrorCarrier) {
+      return await mapUpstreamError(e.resp, "anthropic");
+    }
+    return errAnthropic(503, "api_error", e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** 从 countTokens loader 内部携带上游错误响应的异常（避免错误响应被缓存层吞掉） */
+class UpstreamErrorCarrier extends Error {
+  resp: Response;
+  constructor(resp: Response) {
+    super("upstream error HTTP " + resp.status);
+    this.resp = resp;
   }
 }

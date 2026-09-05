@@ -37,6 +37,8 @@ export interface ActiveModelTable {
   native_only: string[];
   excluded: string[];
   known: Set<string>;
+  /** v1.6.0：chat 模型名集合（isChatModelActive 由 O(n) includes 改为 O(1) 查询） */
+  chatSet: Set<string>;
   meta: Map<string, GModelMeta>;
 }
 
@@ -80,6 +82,7 @@ export function buildTable(source: "builtin" | "official", fetchedAt: string | u
     native_only: cls.native_only.map((m) => m.name),
     excluded: cls.excluded.map((m) => m.name),
     known: new Set([...cls.chat, ...cls.native_only].map((m) => m.name)),
+    chatSet: new Set(cls.chat.map((m) => m.name)),
     meta,
   };
 }
@@ -115,7 +118,7 @@ export function listExcludedModels(): string[] {
 }
 
 export function isChatModelActive(name: string): boolean {
-  return activeTable().chat.includes(name);
+  return activeTable().chatSet.has(name);
 }
 
 export function isKnownModelActive(name: string): boolean {

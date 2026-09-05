@@ -12,8 +12,9 @@ import type {
   OMessage,
   ORequest,
 } from "../types.ts";
-import { bytesToBase64, cleanJsonSchema, imageToInlineData, partFunctionCall, partInlineData, partText, randomId, textPart } from "./common.ts";
+import { bytesToBase64, cleanJsonSchema, imageToInlineData, isThoughtPart, partFunctionCall, partInlineData, partText, randomId, textPart } from "./common.ts";
 import { reasoningEffortToLevel } from "../thinking.ts";
+import { PrefillEchoFilter } from "../prefill.ts";
 
 // ===== 请求转换 =====
 
@@ -188,11 +189,13 @@ export function geminiToOpenAI(g: GResponse, model: string, id: string, created:
   const cand = g.candidates?.[0];
   const parts = cand?.content?.parts ?? [];
   let text = "";
+  let reasoning = ""; // 思考摘要聚合 → reasoning_content（DeepSeek R1 事实标准字段；无 thought 时不输出该字段）
   const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
   for (const p of parts) {
     const t = partText(p);
     if (t !== undefined) {
-      text += t;
+      if (isThoughtPart(p)) reasoning += t;
+      else text += t;
       continue;
     }
     const fc = partFunctionCall(p);
@@ -211,6 +214,7 @@ export function geminiToOpenAI(g: GResponse, model: string, id: string, created:
     }
   }
   const message: Record<string, unknown> = { role: "assistant", content: text || null };
+  if (reasoning) message.reasoning_content = reasoning;
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
   const finish = mapFinishReason(cand?.finishReason, toolCalls.length > 0);
   return {
@@ -226,7 +230,9 @@ export function geminiToOpenAI(g: GResponse, model: string, id: string, created:
 
 // ===== 流式转换 =====
 
-/** Gemini SSE chunk → OpenAI chunk 序列生成器（工具调用按 index 累积） */
+/** Gemini SSE chunk → OpenAI chunk 序列生成器（工具调用按 index 累积）。
+ *  v1.7.0：thought 思考摘要 → delta.reasoning_content（不再混入 content）；
+ *  prefill 非空时对 content 增量做回声剥离状态机过滤（流末冲刷残余）。 */
 export async function* geminiSseToOpenaiChunks(
   geminiChunks: AsyncIterable<GResponse>,
   model: string,
@@ -234,14 +240,21 @@ export async function* geminiSseToOpenaiChunks(
   created: number,
   includeUsage: boolean,
   onUsage?: (u: OpenAIUsage) => void,
+  prefill?: string,
 ): AsyncGenerator<string> {
   let toolIndex = 0;
   let usage: OpenAIUsage | null = null;
   let finishSent = false;
   let sawToolCall = false;
+  const filter = prefill ? new PrefillEchoFilter(prefill) : null;
 
   const chunkHeader = () => ({ id, object: "chat.completion.chunk", created, model });
   const emit = (chunk: Record<string, unknown>): string => "data: " + JSON.stringify(chunk) + "\n\n";
+  const emitContent = (t: string, withLogprobs = true): string =>
+    emit({
+      ...chunkHeader(),
+      choices: [{ index: 0, delta: { content: t }, finish_reason: null, ...(withLogprobs ? { logprobs: null } : {}) }],
+    });
 
   // 首块：role
   yield emit({ ...chunkHeader(), choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] });
@@ -257,10 +270,16 @@ export async function* geminiSseToOpenaiChunks(
       const t = partText(p);
       const fc = partFunctionCall(p);
       if (t) {
-        yield emit({
-          ...chunkHeader(),
-          choices: [{ index: 0, delta: { content: t }, finish_reason: null, logprobs: null }],
-        });
+        if (isThoughtPart(p)) {
+          // 思考摘要 → reasoning_content 增量（DeepSeek R1 风格）
+          yield emit({
+            ...chunkHeader(),
+            choices: [{ index: 0, delta: { reasoning_content: t }, finish_reason: null }],
+          });
+        } else {
+          const out = filter ? filter.feed(t) : t;
+          if (out) yield emitContent(out);
+        }
       } else if (fc) {
         sawToolCall = true;
         const tc = {
@@ -276,12 +295,7 @@ export async function* geminiSseToOpenaiChunks(
       } else {
         const inline = partInlineData(p);
         if (inline) {
-          yield emit({
-            ...chunkHeader(),
-            choices: [
-              { index: 0, delta: { content: "![image](data:" + (inline.mime_type || "image/png") + ";base64," + inline.data + ")\n" }, finish_reason: null, logprobs: null },
-            ],
-          });
+          yield emitContent("![image](data:" + (inline.mime_type || "image/png") + ";base64," + inline.data + ")\n");
         }
       }
     }
@@ -292,6 +306,11 @@ export async function* geminiSseToOpenaiChunks(
         choices: [{ index: 0, delta: {}, finish_reason: mapFinishReason(cand.finishReason, sawToolCall) }],
       });
     }
+  }
+  // 流末冲刷预填充过滤器残余（前缀歧义尾巴）
+  if (filter) {
+    const tail = filter.finish();
+    if (tail) yield emitContent(tail);
   }
   if (!finishSent) {
     yield emit({

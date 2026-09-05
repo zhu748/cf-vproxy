@@ -14,7 +14,7 @@
 //
 // 关闭竞速时退回「健康分排序 + 轮换 + 故障接力」的顺序模式（rotateUpstream）。
 import type { Env } from "../config.ts";
-import { DEFAULT_RACING, type RacingConfig } from "../racing.ts";
+import { DEFAULT_RACING, retryDelayMs, shouldRetryDirect, type RacingConfig } from "../racing.ts";
 import {
   averageLatency,
   ensureHealthLoaded,
@@ -33,6 +33,8 @@ import { viaProxy, type ProxyPool } from "./proxyfetch.ts";
 export type { ProxyPool };
 
 const clampNum = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export interface UpstreamResult {
   response: Response;
@@ -340,7 +342,8 @@ export async function raceUpstream(
 
 /**
  * 统一出站 fetch：
- *   - 无代理池 → 直连；
+ *   - 无代理池 → 直连（v1.6.0：429/408/425/5xx 按上游 Retry-After 退避后重试一次，
+ *     对齐代理模式的节点内重试语义 —— 此前直连模式瞬时错误直接透传给客户端）；
  *   - 竞速关闭或池中仅 1 节点 → 健康排序轮换 + 故障接力（rotateUpstream）；
  *   - 竞速开启 → 对冲竞速（raceUpstream）。
  * 健康度快照冷启动恢复只发生一次；请求结束后按需批量刷盘 KV。
@@ -356,7 +359,13 @@ export async function dispatchUpstream(
   await ensureHealthLoaded(env);
   const rc = racing ?? DEFAULT_RACING;
   if (!pool || pool.size === 0) {
-    const resp = await fetch(url, init);
+    let resp = await fetch(url, init);
+    if (shouldRetryDirect(resp.status)) {
+      const delay = retryDelayMs(resp.headers.get("retry-after"));
+      void resp.body?.cancel().catch(() => {});
+      await sleep(delay);
+      resp = await fetch(url, init);
+    }
     return { response: resp, via: "direct" };
   }
   let result: UpstreamResult;

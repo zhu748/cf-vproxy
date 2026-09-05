@@ -4,6 +4,38 @@
 > 专为 Cloudflare Workers（免费计划即可）设计。转换层逻辑与原项目对齐，去掉了 reCAPTCHA 突破、
 > TLS 指纹伪装、mihomo 代理内核等 Workers 沙箱无法实现的部分。
 >
+> **v1.7.0 更新（思考摘要分流 + 流式基础设施统一）**：
+> ① **修复思考摘要泄漏正文**——Gemini `thought:true` parts 此前被所有响应转换器当普通文本吐给客户端
+> （Anthropic 路径默认开启 `includeThoughts`，Claude Code 用户会看到内部思考混入回复）；现在
+> **Anthropic 端点 → Claude 原生 `thinking` 块**（流式含 `thinking_delta`/`signature_delta` 完整事件序列），
+> **OpenAI 端点 → `reasoning_content` 字段**（DeepSeek R1 事实标准，无 thought 时不输出该字段），
+> Responses 端点丢弃（协议无对应块）；
+> ② **流式路径三统一**——Anthropic / Responses 端点此前手写 ReadableStream，现统一走
+> `sseResponseFromGenerator`：补齐 **10s ping 保活**（长思考请求不再被空闲超时掐断）与
+> **客户端断开时取消上游**（不再继续烧 token）；
+> ③ **修复 OpenAI 真流式用量从不入账**（旧实现 onUsage 传空函数）——现在所有流式请求结束时
+> （含断开/异常中断）幂等记录 token 用量；
+> ④ **修复 Anthropic 流式丢图像输出**（图像模型经 Anthropic 端点流式为空，现转 markdown 文本块）、
+> **OpenAI 预填充回声剥离补齐全部 4 条路径**（真流式 / aggregate 非流式此前不剥）；
+> ⑤ **健壮性**：Anthropic 空响应补空 `text` 块（safety 拒答不再输出 `content:[]`）、
+> 面板日志把 `/v1/responses`、`/v1/audio`、`/v1/images` 正确归入 openai 协议分桶；新增 17 项单测（148 项全绿）。
+>
+> **v1.6.0 更新（接线修复 + 性能与健壮性全面优化）**：
+> ① **修复 5 个“实现了但从未接入路由”的端点**——`/v1/responses`（OpenAI Responses API）、
+> `/v1/audio/speech`（TTS）、`/v1/images/generations|edits|variations`（图像）此前请求只会 404，
+> 现已全部可达（处理器早已完整实现，v1.5.0 文档宣称的 Responses 假流式从此真正生效）；
+> ② **修复 KV 读瞬时失败覆写配置的破坏性 bug**（旧版可能用默认配置覆盖已保存配置）；
+> ③ **补齐 `max_request_mb` / `max_concurrent_requests` 两个配置项的实际执行**（请求体超限 413、
+> 并发超限 503 + Retry-After，此前两项只有配置没有运行时逻辑）；
+> ④ **接线 `count_tokens` 缓存**（single-flight + LRU + TTL，Anthropic 计数不再每次裸调上游）与
+> **Gemini 原生响应规范化**（占位符清理 / 空流错误帧 / 补 STOP 帧 / RikkaHub 兼容，
+> 同时修复 `generateContent`/`countTokens` 的用量双重计数 bug）；
+> ⑤ **性能**：订阅缓存与代理池解析改为 30s 内存缓存（不再每请求读 KV + 全量重解析）、
+> `isChatModelActive` O(n)→O(1)、删除假流式非流式路径的无用生成器消费；
+> ⑥ **健壮性**：直连模式 429/5xx 按上游 Retry-After 退避重试一次、上游 Retry-After 透传、
+> 图片拉取 10MiB 上限、ADMIN_TOKEN 常量时间比较、`startTls` 失败时关闭 socket、
+> 新增 `GET /v1/models/{model}`（OpenAI SDK 兼容）；路由抽离为纯模块并新增 29 项单测（131 项全绿）。
+>
 > **v1.5.0 更新（假流式全端点对齐）**：补齐原项目假流式（fake stream）在 Gemini 原生与 Anthropic 端点的移植——
 > `fake-` / `假流式-` 前缀现在在 **OpenAI chat / OpenAI responses / Anthropic / Gemini 原生** 四类端点全部生效；
 > `/v1/models` 与 `/v1beta/models` 参照原项目 `ModelsWithFakeVariants` 暴露变体（每个 chat 模型展开为
@@ -45,9 +77,12 @@ generativelanguage.googleapis.com  （Gemini 官方 API，你的单个 API Key�
 
 | 能力 | 说明 |
 |------|------|
-| OpenAI 协议 | `POST /v1/chat/completions`（流式/非流式）、`GET /v1/models` |
-| Anthropic 协议 | `POST /v1/messages`（流式/非流式）、`POST /v1/messages/count_tokens` |
-| Gemini 原生 | `POST /v1beta/models/{model}:generateContent / :streamGenerateContent?alt=sse / :countTokens / :predict / :predictLongRunning`（请求体透传）、`GET /v1beta/models`（当前生效模型表，带官方元数据） |
+| OpenAI 协议 | `POST /v1/chat/completions`（流式/非流式）、`GET /v1/models`、`GET /v1/models/{model}`、`POST /v1/responses`（Responses API）、`POST /v1/audio/speech`（TTS）、`POST /v1/images/generations / edits / variations`（图像） |
+| Anthropic 协议 | `POST /v1/messages`（流式/非流式）、`POST /v1/messages/count_tokens`（**带 single-flight + LRU + TTL 缓存**） |
+| Gemini 原生 | `POST /v1beta/models/{model}:generateContent / :streamGenerateContent?alt=sse / :countTokens / :predict / :predictLongRunning`（请求体透传 + 响应规范化）、`GET /v1beta/models`（当前生效模型表，带官方元数据） |
+| **请求闸门** | **v1.6.0**：`max_concurrent_requests` 全局并发门（超出 503 + `Retry-After`）；`max_request_mb` 请求体上限（超出 413，content-length 预检 + 实测复核） |
+| **思考摘要分流** | **v1.7.0**：Gemini `includeThoughts` 思考摘要在 Anthropic 端点转为 Claude 原生 `thinking` 块（流式含 thinking_delta/signature_delta 完整事件序列）、OpenAI 端点转为 `reasoning_content` 字段（DeepSeek R1 事实标准）—— 不再混入正文 |
+| **流式基础设施** | **v1.7.0**：全部三协议流式路径统一 10s ping 保活（长思考请求不被空闲超时掐断）+ 客户端断开即取消上游（不烧无效 token）+ 流结束（含断开）幂等记录用量 |
 | 对话能力 | 纯文本、图片输入（base64 / URL / data URI）、工具调用（function calling 双向转换，含流式增量）、**n 多候选**（非流式 `n>1` 并发 n 次上游请求合并 choices，受 max_n 上限保护） |
 | **官方模型表** | **v1.4.0**：内置表为官方 ListModels 实拉数据（构建时生成，含 54 个模型的官方元数据）；运行时在面板「模型」页一键 **从官方重新拉取**（用当前上游 Key 调官方接口，自动分页、代理适配，KV 持久化立即生效），可一键恢复内置表；`/v1/models`、`/v1beta/models`、模型校验均动态跟随 |
 | **假流式** | **v1.5.0 全端点**：模型名前缀 `fake-` / `假流式-`（别名目标同样生效）→ 上游非流式请求 + 合成流式输出（OpenAI/Responses/Gemini 按码点切 ≤8 块，Anthropic 整段单 delta，与原项目逐端点对齐）；`aggregate_stream=true` 时 OpenAI/Anthropic/Responses 端点全部聚合（Gemini 原生仅认前缀，同原项目）；模型列表自动暴露三变体 |

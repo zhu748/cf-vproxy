@@ -1,6 +1,7 @@
 // 上游调用 + 模型校验 —— 各协议处理器共用的胶水层
 import type { VProxyConfig } from "./types.ts";
 import type { GGenerationConfig } from "./types.ts";
+import type { Env } from "./config.ts";
 import { pickGeminiKey } from "./config.ts";
 import { dispatchUpstream, type ProxyPool } from "./proxy/racefetch.ts";
 import { errOpenAI, json } from "./convert/common.ts";
@@ -10,14 +11,7 @@ import { isGemini36OrLater, normalizeThinkingConfig } from "./thinking.ts";
 export { resolveModel, type ModelResolution } from "./modelresolve.ts";
 
 export interface HandlerCtx {
-  env: {
-    VPROXY_KV: KVNamespace;
-    API_KEYS?: string;
-    GEMINI_API_KEY?: string;
-    GEMINI_API_KEYS?: string;
-    PROXY_URLS?: string;
-    ADMIN_TOKEN?: string;
-  };
+  env: Env;
   cfg: VProxyConfig;
   pool: ProxyPool | null;
   waitUntil: (p: Promise<unknown>) => void;
@@ -87,7 +81,7 @@ export async function callGemini(ctx: HandlerCtx, model: string, action: string,
   return response;
 }
 
-/** 将上游错误响应转成对应协议格式的 Response */
+/** 将上游错误响应转成对应协议格式的 Response（v1.6.0：透传上游 Retry-After 头） */
 export async function mapUpstreamError(
   upstream: Response,
   protocol: "openai" | "anthropic" | "gemini",
@@ -101,13 +95,15 @@ export async function mapUpstreamError(
   } catch {
     // 保留默认 message
   }
-  if (protocol === "openai") return errOpenAI(status, message);
+  const retryAfter = upstream.headers.get("retry-after");
+  const extraHeaders = retryAfter ? { "retry-after": retryAfter } : undefined;
+  if (protocol === "openai") return errOpenAI(status, message, undefined, extraHeaders);
   if (protocol === "anthropic") {
     const t =
       status === 401 ? "authentication_error" : status === 429 ? "rate_limit_error" : status === 400 ? "invalid_request_error" : "api_error";
     return new Response(JSON.stringify({ type: "error", error: { type: t, message } }), {
       status,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(extraHeaders ?? {}) },
     });
   }
   const s =
@@ -118,5 +114,5 @@ export async function mapUpstreamError(
         : status >= 500
           ? "UNAVAILABLE"
           : "INVALID_ARGUMENT";
-  return json({ error: { code: status, message, status: s } }, status);
+  return json({ error: { code: status, message, status: s } }, status, extraHeaders);
 }

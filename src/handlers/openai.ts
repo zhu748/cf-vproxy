@@ -1,7 +1,7 @@
 // OpenAI 协议处理器：POST /v1/chat/completions + GET /v1/models
 // v1.3.0：思考强度归一化、预填充适配 + 回声剥离、假流式（fake-/假流式- 前缀 / aggregate_stream）、
 //         SSE ping 保活、图像模型输出 markdown 化。
-import { errOpenAI, json, randomId, partInlineData, partFunctionCall, partText, resolveN } from "../convert/common.ts";
+import { errOpenAI, json, randomId, partInlineData, partFunctionCall, partText, isThoughtPart, resolveN } from "../convert/common.ts";
 import {
   geminiSseToOpenaiChunks,
   geminiToOpenAI,
@@ -83,11 +83,12 @@ export async function handleChatCompletions(req: Request, ctx: HandlerCtx): Prom
   }
   if (!upstream.ok) return await mapUpstreamError(upstream, "openai");
 
-  // ---- 非流式 ----
-  if (!oreq.stream && !fake) {
-    let g;
+  // ---- 非流式（含 aggregate_stream 开启但客户端未要流式的场景：直接走非流式信封，
+  //      v1.7.0：合并旧 fake+非流式独立分支 —— 该分支此前漏掉 prefill 回声剥离）----
+  if (!oreq.stream) {
+    let g: GResponse;
     try {
-      g = (await upstream.json()) as Parameters<typeof geminiToOpenAI>[0];
+      g = (await upstream.json()) as GResponse;
     } catch (e) {
       return errOpenAI(502, "invalid upstream response: " + (e instanceof Error ? e.message : String(e)));
     }
@@ -103,11 +104,12 @@ export async function handleChatCompletions(req: Request, ctx: HandlerCtx): Prom
     return json(out);
   }
 
-  // ---- 流式 / 假流式 ----
+  // ---- 流式 / 假流式（客户端 stream=true）----
   const includeUsage = oreq.stream_options?.include_usage === true;
   const displayModel = resolved.display ?? oreq.model;
 
   let gen: AsyncGenerator<string>;
+  let lastUsage: OpenAIUsage | null = null;
   if (fake) {
     // 假流式：完整响应 → 按 rune 边界 ≤8 块连续吐出（无人为间隔）
     let g: GResponse;
@@ -117,31 +119,32 @@ export async function handleChatCompletions(req: Request, ctx: HandlerCtx): Prom
       return errOpenAI(502, "invalid upstream response: " + (e instanceof Error ? e.message : String(e)));
     }
     gen = fakeStreamFromGeminiResponse(g, displayModel, id, created, includeUsage, adapted.prefill);
-    if (!oreq.stream) {
-      // 客户端根本没要流式（仅 aggregate_stream 开启）：直接走非流式信封
-      const single: string[] = [];
-      for await (const frame of gen) single.push(frame);
-      const collected = single.join("");
-      void collected;
-      const out = geminiToOpenAI(g, displayModel, id, created);
-      const usage = out.usage as OpenAIUsage;
-      recordUsage(ctx.clientKey, resolved.model, usage.prompt_tokens, usage.completion_tokens);
-      ctx.waitUntil(scheduleFlush(ctx.env));
-      return json(out);
-    }
   } else {
     if (!upstream.body) return errOpenAI(502, "empty upstream stream");
+    // v1.7.0：真流式接入 usage 回调（旧实现传空函数 —— OpenAI 流式请求的 token 用量从未入账）
+    // 与 prefill 回声剥离（旧实现只覆盖非流式/假流式两条路径）
     gen = geminiSseToOpenaiChunks(
       geminiJsonChunks(upstream.body),
       displayModel,
       id,
       created,
       includeUsage,
-      () => {},
+      (u) => {
+        lastUsage = u;
+      },
+      adapted.prefill,
     );
   }
 
-  return sseResponseFromGenerator(gen, upstream);
+  // v1.7.0：流结束（含客户端断开/异常中断）幂等记录用量 —— 与 Anthropic/Gemini/Responses 路径对齐
+  let usageRecorded = false;
+  const recordStreamUsage = () => {
+    if (usageRecorded) return;
+    usageRecorded = true;
+    recordUsage(ctx.clientKey, resolved.model, lastUsage?.prompt_tokens ?? 0, lastUsage?.completion_tokens ?? 0);
+    ctx.waitUntil(scheduleFlush(ctx.env));
+  };
+  return sseResponseFromGenerator(gen, upstream, recordStreamUsage);
 }
 
 /**
@@ -236,12 +239,14 @@ export async function* fakeStreamFromGeminiResponse(
   const cand = g.candidates?.[0];
   const parts = cand?.content?.parts ?? [];
   let text = "";
+  let reasoning = ""; // v1.7.0：思考摘要 → reasoning_content 增量（与真流式行为一致）
   const toolCalls: Array<{ index: number; id: string; type: "function"; function: { name: string; arguments: string } }> = [];
   let toolIndex = 0;
   for (const p of parts) {
     const t = partText(p);
     if (t !== undefined) {
-      text += t;
+      if (isThoughtPart(p)) reasoning += t;
+      else text += t;
       continue;
     }
     const fc = partFunctionCall(p);
@@ -261,6 +266,10 @@ export async function* fakeStreamFromGeminiResponse(
 
   // 首块：role
   yield emit({ ...header(), choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] });
+  // reasoning 块（思考摘要，DeepSeek R1 风格）
+  for (const chunk of splitFakeChunks(reasoning)) {
+    yield emit({ ...header(), choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }] });
+  }
   // content 块
   for (const chunk of splitFakeChunks(text)) {
     yield emit({ ...header(), choices: [{ index: 0, delta: { content: chunk }, finish_reason: null, logprobs: null }] });

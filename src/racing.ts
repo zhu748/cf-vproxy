@@ -265,6 +265,32 @@ export function averageLatency(healthMap: Map<string, ProxyHealth>, now: number)
   return count === 0 ? 500 : sum / count;
 }
 
+// ---------- 直连（无代理池）模式退避重试（v1.6.0） ----------
+
+/**
+ * 直连模式下是否值得单次重试：
+ * 429 / 408 / 425 / 5xx 属于瞬时故障（上游限流或抖动），退避后重发一次价值高；
+ * 2xx / 3xx 成功与其余 4xx（请求级错误，重发必然同样失败）不重试。
+ */
+export function shouldRetryDirect(status: number): boolean {
+  return status === 429 || status === 408 || status === 425 || status >= 500;
+}
+
+/**
+ * 重试退避时长（毫秒）：优先遵循上游 Retry-After 头（秒数或 HTTP 日期格式），
+ * 钳位 250ms–4s（避免请求长时间挂起），无头时默认 500ms。
+ */
+export function retryDelayMs(retryAfterHeader: string | null | undefined, nowMs: number = Date.now()): number {
+  const clamp = (v: number) => Math.min(Math.max(v, 250), 4_000);
+  if (typeof retryAfterHeader === "string" && retryAfterHeader.trim()) {
+    const sec = Number(retryAfterHeader.trim());
+    if (Number.isFinite(sec) && sec >= 0) return clamp(sec * 1000);
+    const date = Date.parse(retryAfterHeader);
+    if (Number.isFinite(date)) return clamp(date - nowMs);
+  }
+  return 500;
+}
+
 // ---------- isolate 全局健康存储 + KV 快照同步 ----------
 
 const HEALTH_KEY = "proxy_health";

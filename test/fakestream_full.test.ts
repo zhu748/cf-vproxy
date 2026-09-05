@@ -231,13 +231,14 @@ test("fakeStreamAnthropicEvents: 工具调用输出 tool_use 块，stop_reason=t
   assert.equal(events[4].data.delta.stop_reason, "tool_use");
 });
 
-test("fakeStreamAnthropicEvents: 空响应仍输出完整事件序列（end_turn）", async () => {
+test("fakeStreamAnthropicEvents: 空响应仍输出完整事件序列（v1.7.0：补空 text 块，end_turn）", async () => {
   const events = await collect(fakeStreamAnthropicEvents({}, "m", "msg_2"));
   assert.deepEqual(
     events.map((e) => e.event),
-    ["message_start", "message_delta", "message_stop"],
+    ["message_start", "content_block_start", "content_block_stop", "message_delta", "message_stop"],
   );
-  assert.equal(events[1].data.delta.stop_reason, "end_turn");
+  assert.equal(events[1].data.content_block.type, "text");
+  assert.equal(events[events.length - 2].data.delta.stop_reason, "end_turn");
 });
 
 test("fakeStreamAnthropicEvents: MAX_TOKENS → stop_reason=max_tokens（Anthropic 规范值）", async () => {

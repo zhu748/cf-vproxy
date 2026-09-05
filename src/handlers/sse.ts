@@ -23,8 +23,14 @@ const sleep = (ms: number) => new Promise<"ping">((r) => setTimeout(r, ms));
 /**
  * 把 AsyncGenerator<string> 包成 SSE Response（带 10s ping 保活）。
  * upstream 可选：客户端断开时同步中止的上游响应。
+ * onDone 可选（v1.7.0）：流正常结束 / 异常中断 / 客户端断开时各调用一次
+ * （幂等性由调用方闭包保证）—— 用于流式请求的用量记录等收尾动作。
  */
-export function sseResponseFromGenerator(gen: AsyncGenerator<string>, upstream?: Response | null): Response {
+export function sseResponseFromGenerator(
+  gen: AsyncGenerator<string>,
+  upstream?: Response | null,
+  onDone?: () => void,
+): Response {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -40,11 +46,24 @@ export function sseResponseFromGenerator(gen: AsyncGenerator<string>, upstream?:
             continue; // 继续等待同一个 next() promise
           }
           const { value, done } = winner.v;
-          if (done) controller.close();
-          else controller.enqueue(encoder.encode(value));
+          if (done) {
+            try {
+              onDone?.();
+            } catch {
+              // 收尾回调失败不影响流关闭
+            }
+            controller.close();
+          } else {
+            controller.enqueue(encoder.encode(value));
+          }
           return;
         }
       } catch (e) {
+        try {
+          onDone?.();
+        } catch {
+          // 忽略收尾回调异常
+        }
         void upstream?.body?.cancel().catch(() => {});
         try {
           controller.error(e);
@@ -54,6 +73,11 @@ export function sseResponseFromGenerator(gen: AsyncGenerator<string>, upstream?:
       }
     },
     cancel() {
+      try {
+        onDone?.();
+      } catch {
+        // 忽略收尾回调异常
+      }
       void gen.return(undefined as unknown as string).catch(() => {});
       void upstream?.body?.cancel().catch(() => {});
     },

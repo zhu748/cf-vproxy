@@ -41,7 +41,9 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(bin);
 }
 
-/** data: URI → inlineData；http(s) URL → 拉取后转 inlineData */
+/** data: URI → inlineData；http(s) URL → 拉取后转 inlineData（v1.6.0：限制拉取体积，防大图打爆内存） */
+export const MAX_IMAGE_FETCH_BYTES = 10 * 1024 * 1024; // 10 MiB
+
 export async function imageToInlineData(
   url: string,
 ): Promise<{ mime_type: string; data: string } | null> {
@@ -55,8 +57,15 @@ export async function imageToInlineData(
   }
   const resp = await fetch(url, { signal: AbortSignal.timeout(20_000) });
   if (!resp.ok) throw new Error("fetch image failed: " + url + " HTTP " + resp.status);
+  const cl = Number(resp.headers.get("content-length") ?? "0");
+  if (Number.isFinite(cl) && cl > MAX_IMAGE_FETCH_BYTES) {
+    throw new Error("image too large: " + cl + " bytes > " + MAX_IMAGE_FETCH_BYTES + " (" + url + ")");
+  }
   const mime = resp.headers.get("content-type")?.split(";")[0] || "image/png";
   const buf = new Uint8Array(await resp.arrayBuffer());
+  if (buf.length > MAX_IMAGE_FETCH_BYTES) {
+    throw new Error("image too large: " + buf.length + " bytes > " + MAX_IMAGE_FETCH_BYTES + " (" + url + ")");
+  }
   return { mime_type: mime, data: bytesToBase64(buf) };
 }
 
@@ -119,8 +128,20 @@ export function resolveN(raw: unknown, maxN: number): { n: number; error?: strin
   return { n: v };
 }
 
-export function errOpenAI(status: number, message: string, code?: string): Response {
-  return json({ error: { message, type: status === 401 ? "invalid_request_error" : "api_error", code: code ?? null } }, status);
+export function errOpenAI(status: number, message: string, code?: string, headers?: Record<string, string>): Response {
+  return json(
+    { error: { message, type: status === 401 ? "invalid_request_error" : "api_error", code: code ?? null } },
+    status,
+    headers,
+  );
+}
+
+/** 常量时间字符串比较（token/secret 比对用，缓解时序侧信道） */
+export function tokensEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 export function errAnthropic(status: number, type: string, message: string): Response {
@@ -143,6 +164,13 @@ export function json(obj: unknown, status = 200, headers?: Record<string, string
 export function partText(p: GPart): string | undefined {
   const v = (p as { text?: unknown }).text;
   return typeof v === "string" ? v : undefined;
+}
+
+/** 思考摘要 part（Gemini includeThoughts 开启时返回 {text, thought:true}）。
+ *  v1.7.0：此前所有响应转换器都把 thought 文本当普通正文吐给客户端 ——
+ *  Anthropic 路径默认 includeThoughts=true，Claude Code 用户会看到内部思考混入回复。 */
+export function isThoughtPart(p: GPart): boolean {
+  return (p as { thought?: unknown }).thought === true;
 }
 
 export function partFunctionCall(p: GPart): { name: string; args?: Record<string, unknown> } | null {

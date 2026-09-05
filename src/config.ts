@@ -122,9 +122,13 @@ export function sanitizeConfig(raw: unknown): VProxyConfig {
 export async function loadConfig(env: Env, force = false): Promise<VProxyConfig> {
   if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
   let raw: unknown = null;
+  let readFailed = false;
   try {
     raw = await env.VPROXY_KV.get(CONFIG_KEY, "json");
   } catch {
+    // ⚠️ 关键：KV 读瞬时失败 ≠「KV 无配置」。若当成缺失走默认值并写回，
+    // 会用默认配置覆盖用户已保存的配置（破坏性 bug，v1.6.0 修复）。
+    readFailed = true;
     raw = null;
   }
   let cfg: VProxyConfig;
@@ -137,14 +141,17 @@ export async function loadConfig(env: Env, force = false): Promise<VProxyConfig>
     if (cfg.proxies.length === 0) cfg.proxies = d.proxies;
   } else {
     cfg = defaultConfig(env);
-    // 首次初始化：把 env 兜底配置写进 KV，后续即可纯 KV/面板管理
-    try {
-      await env.VPROXY_KV.put(CONFIG_KEY, JSON.stringify(cfg));
-    } catch {
-      // KV 写失败不阻塞请求
+    // 仅在「确认 KV 里确实没有配置」时才初始化写回；读失败时只服务默认值、不落盘
+    if (!readFailed) {
+      try {
+        await env.VPROXY_KV.put(CONFIG_KEY, JSON.stringify(cfg));
+      } catch {
+        // KV 写失败不阻塞请求
+      }
     }
   }
-  cached = { value: cfg, at: Date.now() };
+  // 读失败时只缓存 5 秒（而不是 60 秒）：下个请求很快重试 KV，又不至于失败风暴时每请求都打 KV
+  cached = readFailed ? { value: cfg, at: Date.now() - CACHE_TTL_MS + 5_000 } : { value: cfg, at: Date.now() };
   return cfg;
 }
 
