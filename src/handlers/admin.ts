@@ -120,24 +120,36 @@ export async function handleAdmin(
     return json({ ok: true, proxies: result.proxies.length, skipped_unsupported: result.skipped });
   }
 
-  // ---- 代理连通性测试（单节点，写入健康度） ----
+  // ---- 代理连通性测试（单节点，写入健康度；v2.2 支持 runs=2/3 同 isolate 连测验证连接复用） ----
   if (req.method === "POST" && (path === "/admin/proxy/test" || path === "/admin/proxy/test/")) {
-    let body: { proxy?: string };
+    let body: { proxy?: string; runs?: number };
     try {
-      body = (await req.json()) as { proxy?: string };
+      body = (await req.json()) as { proxy?: string; runs?: number };
     } catch {
       return json({ error: "Invalid JSON body" }, 400);
     }
     if (!body.proxy) return json({ error: "proxy 字段必填" }, 400);
+    const runs = Math.min(Math.max(Number(body.runs) || 1, 1), 3);
     // v1.8.0：先 ensureHealthLoaded —— 冷启动 isolate 直接测速会以「仅含本节点」的内存表
     // flush 覆盖 KV，其余节点的历史健康度（胜出记忆/冷却/延迟 EMA）全部丢失
     await ensureHealthLoaded(envVars);
     const { testProxy } = await import("../proxy/proxyfetch.ts");
-    const r = await testProxy(body.proxy);
-    if (r.ok) recordProxySuccess(body.proxy, r.latency_ms);
-    else recordProxyFailure(body.proxy, r.error ?? "unreachable");
+    const { connPool } = await import("../proxy/connpool.ts");
+    const results = [];
+    for (let i = 0; i < runs; i++) {
+      const r = await testProxy(body.proxy);
+      if (r.ok) recordProxySuccess(body.proxy, r.latency_ms);
+      else recordProxyFailure(body.proxy, r.error ?? "unreachable");
+      results.push(r);
+    }
     waitUntil(flushHealthNow(envVars));
-    return json(r);
+    const connStats = connPool.stats();
+    return json({
+      ...results[0],
+      runs: results,
+      conn_pool: { idle_conns: connStats.idleConns, warm_proxies: connStats.warmProxies },
+      _hint: runs > 1 ? "runs 依次在同一 isolate 内执行：第 2 次起命中 Keep-Alive 暖连接（跳过 TCP/代理/TLS 握手），latency_ms 显著下降即复用生效" : undefined,
+    });
   }
 
   // ---- 全量并发测速（写入健康度） ----
@@ -164,13 +176,17 @@ export async function handleAdmin(
     await ensureHealthLoaded(envVars);
     const now = Date.now();
     const sticky = [...healthMapSnapshot().entries()].filter(([, h]) => h.sticky).map(([uri]) => uri);
+    // v2.2.0：连接复用池观测（isolate 内存级；warm 连接 = 下一个请求可跳过全部握手）
+    const { connPool } = await import("../proxy/connpool.ts");
+    const connStats = connPool.stats();
     return json({
       racing: cfg.racing,
       health: allHealthRecords(),
       avg_latency_ms: Math.round(averageLatency(healthMapSnapshot(), now)),
       sticky,
       pool_breaker: poolBreakerSnapshot(),
-      _hint: "健康度为 isolate 内存 + KV 快照（20s 批量刷盘）；score 由成功率/延迟/连败/粘性综合计算。pool_breaker.open=true 时代理池被熔断（Workers 平台 TLS 过隧道不可用 / 全池连败），请求自动回退直连",
+      conn_pool: { idle_conns: connStats.idleConns, warm_proxies: connStats.warmProxies, conns: connStats.conns },
+      _hint: "健康度为 isolate 内存 + KV 快照（20s 批量刷盘）；score 由成功率/延迟/连败/粘性综合计算。pool_breaker.open=true 时代理池被熔断（Workers 平台 TLS 过隧道不可用 / 全池连败），请求自动回退直连。conn_pool 为 v2.2 Keep-Alive 复用池（同 isolate 内后续请求跳过 TCP/代理/TLS 握手）",
     });
   }
 

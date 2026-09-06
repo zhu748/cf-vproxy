@@ -42,7 +42,7 @@ import { matchApiRoute, NEEDS_UPSTREAM, type ApiRoute } from "./router.ts";
 import { acquireSlot, bodyLimitViolation } from "./gate.ts";
 import { withFakeVariants } from "./fakestream.ts";
 
-const VERSION = "1.9.1";
+const VERSION = "2.2.0";
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -272,7 +272,8 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
       clientKey,
     };
 
-    switch (routeInfo.kind) {
+    const dispatchToHandler = async (): Promise<Response> => {
+      switch (routeInfo.kind) {
       // ---- OpenAI ----
       case "chat_completions":
         return await handleChatCompletions(req, hctx);
@@ -307,8 +308,15 @@ async function route(req: Request, env: Env, ctx: ExecutionContext): Promise<Res
         return handleGeminiListModels();
       case "gemini_native":
         return await handleGeminiNative(routeInfo.model ?? "", routeInfo.action ?? "", req, hctx);
-    }
-    return protocolErrorResponse(proto, 404, "未知的路径：" + path + "，可用端点见 GET /");
+      }
+      return protocolErrorResponse(proto, 404, "未知的路径：" + path + "，可用端点见 GET /");
+    };
+    const resp = await dispatchToHandler();
+    // v2.2：处理器重建 Response 会丢失 callGemini 设置的 __via —— 统一从 ctx.lastVia 回填，
+    // 使 /admin/logs 的 via 字段对全部协议稳定可见（含 [warm] 连接复用标记）
+    const tagged = resp as Response & { __via?: string };
+    if (!tagged.__via && hctx.lastVia) tagged.__via = hctx.lastVia;
+    return resp;
   } finally {
     slot.release();
   }

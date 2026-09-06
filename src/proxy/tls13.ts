@@ -530,6 +530,11 @@ export class Tls13Client {
     this.opts = opts;
   }
 
+  /** v2.2：连接是否已关闭（连接池存活判定用） */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;

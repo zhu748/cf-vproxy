@@ -9,13 +9,17 @@ import { connect } from "cloudflare:sockets";
 import type { Env } from "../config.ts";
 import type { VProxyConfig } from "../types.ts";
 import { ByteBufReader } from "./byteio.ts";
+import { connPool, type PooledConn } from "./connpool.ts";
 import { classifyProxyLine, parseProxyUrl, type ProxyEntry } from "./frames.ts";
 import {
   determineBodyShape,
+  isBodylessStatus,
   makeBodyStream,
   parseResponseHeadBlock,
   readFullBody,
+  responseAllowsReuse,
   writeTunnelRequest,
+  type ResponseHead,
 } from "./httpclient.ts";
 import { httpConnectHandshake, socks4Handshake, socks5Handshake } from "./tunnel.ts";
 import { Tls13Client } from "./tls13.ts";
@@ -204,111 +208,168 @@ function closeQuietly(sock: Socket | { close(): Promise<void> }): void {
   }
 }
 
-/** 经单个代理发起请求（HTTPS 上游）；signal 中止时立即关闭底层 socket（竞速败者清理用） */
+/** 经单个代理发起请求（HTTPS 上游）；signal 中止时立即关闭底层 socket（竞速败者清理用）。
+ * v2.2：优先复用池内暖连接（跳过 TCP+代理握手+TLS 握手全部开销）；暖连接在「未收到
+ * 任何响应字节」即失败时自动丢弃并冷路径重试一次（浏览器同款安全重试规则）。 */
 export async function viaProxy(p: ProxyEntry, url: string, init: RequestInit, signal?: AbortSignal): Promise<Response> {
   if (signal?.aborted) throw new Error("attempt aborted before connect");
   const u = new URL(url);
   if (u.protocol !== "https:") throw new Error("viaProxy: only https upstream is supported");
   const targetHost = u.hostname;
   const targetPort = Number(u.port) || 443;
+  const target = targetHost + ":" + targetPort;
 
+  // ---- v2.2 暖连接优先 ----
+  const warm = connPool.acquire(p.raw, target);
+  if (warm) {
+    let sawResponseBytes = false;
+    const markBytes = () => {
+      sawResponseBytes = true;
+    };
+    try {
+      return await sendRequestOnConn(warm, url, init, signal, true, markBytes);
+    } catch (err) {
+      connPool.discard(warm);
+      // 安全重试规则：请求已完整写出但未收到任何响应字节 → 请求大概率未被上游处理，
+      // 重试不会造成重复副作用；收到过（哪怕不完整的）响应字节则必须上抛不重试。
+      if (sawResponseBytes || warm.reader.buffered > 0 || signal?.aborted) throw err;
+    }
+  }
+  if (signal?.aborted) throw new Error("attempt aborted before connect");
+  return await viaProxyCold(p, url, init, targetHost, targetPort, target, signal);
+}
+
+/** v2.2：冷路径 —— 新建 TCP + 代理握手 + TLS 1.3 握手，成功后同样交给连接池管理 */
+async function viaProxyCold(
+  p: ProxyEntry,
+  url: string,
+  init: RequestInit,
+  targetHost: string,
+  targetPort: number,
+  target: string,
+  signal?: AbortSignal,
+): Promise<Response> {
   // v2.0：纯 TCP（不再用 secureTransport:"starttls" —— startTls 已被 TLS 1.3 客户端替代）
   const sock = connect({ hostname: p.host, port: p.port });
   const onAbort = () => closeQuietly(sock);
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
-    return await viaProxyInner(p, url, init, sock, targetHost, targetPort, signal);
+    await withTimeout(sock.opened, CONNECT_TIMEOUT_MS, "proxy connect timeout (" + p.host + ":" + p.port + ")");
+
+    let hs: Awaited<ReturnType<typeof socks5Handshake>>;
+    try {
+      const io = { readable: sock.readable, writable: sock.writable };
+      hs =
+        p.kind === "socks5"
+          ? await withTimeout(socks5Handshake(io, p, targetHost, targetPort), HANDSHAKE_TIMEOUT_MS, "socks5 handshake timeout")
+          : p.kind === "socks4"
+            ? await withTimeout(socks4Handshake(io, p, targetHost, targetPort), HANDSHAKE_TIMEOUT_MS, "socks4 handshake timeout")
+            : await withTimeout(httpConnectHandshake(io, p, targetHost, targetPort), HANDSHAKE_TIMEOUT_MS, "http-proxy handshake timeout");
+    } catch (err) {
+      closeQuietly(sock); // 握手失败/超时：立即释放底层 socket
+      throw err;
+    }
+
+    // v2.0（TLS Handshake Failed 根因修复）：
+    //   边缘的 socket.startTls() 无法在承载过代理握手流量的 socket 上完成 TLS 升级
+    //   （部署在真实边缘的诊断 Worker 分步实测 100% 复现；同一隧道上手写 ClientHello
+    //   可正常收到 Google 的 ServerHello —— 字节层完全透明，仅 startTls 路径坏死）。
+    //   因此弃用 startTls，改为在隧道字节流上直接运行纯 JS 实现的 TLS 1.3 客户端
+    //   （X25519 + AES-128-GCM + HKDF 全部走 WebCrypto 原生算子；证书链固定 GTS 根 +
+    //   SAN + CertificateVerify 完整校验，免费代理池中的 MITM 节点会被直接拒绝）。
+    //   握手读写直接复用代理握手期的 reader/writer（残留缓冲字节不丢失），
+    //   也不再需要 v1.9.0 的 releaseHandshake 释放锁逻辑。
+    const tls = new Tls13Client(hs.reader, hs.writer, {
+      serverName: targetHost,
+      onClose: () => closeQuietly(sock),
+    });
+    try {
+      await withTimeout(tls.handshake(), TLS13_HANDSHAKE_TIMEOUT_MS, "tls13 handshake timeout (" + p.host + ":" + p.port + ")");
+    } catch (err) {
+      closeQuietly(sock); // 超时时握手 promise 仍悬挂：必须显式关 socket（协议错误路径已由 tls.close→onClose 关闭）
+      throw err;
+    }
+    const now = Date.now();
+    const conn: PooledConn = {
+      proxyRaw: p.raw,
+      target,
+      tls,
+      reader: new ByteBufReader({
+        read: () => tls.read().then((v) => (v === null ? { done: true, value: undefined } : { done: false, value: v })),
+        releaseLock: () => {},
+      }),
+      writer: { write: (chunk: Uint8Array) => tls.write(chunk) },
+      created: now,
+      lastUsed: now,
+      uses: 0,
+    };
+    return await sendRequestOnConn(conn, url, init, signal, false);
   } finally {
     signal?.removeEventListener("abort", onAbort);
   }
 }
 
-async function viaProxyInner(
-  p: ProxyEntry,
+/** v2.2：在已建立的 TLS 连接上发送 HTTP/1.1 请求并构造响应。
+ * 响应体流完整消费后按「可复用判定」把连接归还 connPool；中途出错/取消则废弃连接。 */
+async function sendRequestOnConn(
+  conn: PooledConn,
   url: string,
   init: RequestInit,
-  sock: Socket,
-  targetHost: string,
-  targetPort: number,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  warm: boolean,
+  markBytes?: () => void,
 ): Promise<Response> {
-  await withTimeout(sock.opened, CONNECT_TIMEOUT_MS, "proxy connect timeout (" + p.host + ":" + p.port + ")");
-
-  let hs: Awaited<ReturnType<typeof socks5Handshake>>;
-  try {
-    const io = { readable: sock.readable, writable: sock.writable };
-    hs =
-      p.kind === "socks5"
-        ? await withTimeout(socks5Handshake(io, p, targetHost, targetPort), HANDSHAKE_TIMEOUT_MS, "socks5 handshake timeout")
-        : p.kind === "socks4"
-          ? await withTimeout(socks4Handshake(io, p, targetHost, targetPort), HANDSHAKE_TIMEOUT_MS, "socks4 handshake timeout")
-          : await withTimeout(httpConnectHandshake(io, p, targetHost, targetPort), HANDSHAKE_TIMEOUT_MS, "http-proxy handshake timeout");
-  } catch (err) {
-    closeQuietly(sock);
-    throw err;
-  }
-
-  // v2.0（TLS Handshake Failed 根因修复）：
-  //   边缘的 socket.startTls() 无法在承载过代理握手流量的 socket 上完成 TLS 升级
-  //   （部署在真实边缘的诊断 Worker 分步实测 100% 复现；同一隧道上手写 ClientHello
-  //   可正常收到 Google 的 ServerHello —— 字节层完全透明，仅 startTls 路径坏死）。
-  //   因此弃用 startTls，改为在隧道字节流上直接运行纯 JS 实现的 TLS 1.3 客户端
-  //   （X25519 + AES-128-GCM + HKDF 全部走 WebCrypto 原生算子；证书链固定 GTS 根 +
-  //   SAN + CertificateVerify 完整校验，免费代理池中的 MITM 节点会被直接拒绝）。
-  //   握手读写直接复用代理握手期的 reader/writer（残留缓冲字节不丢失），
-  //   也不再需要 v1.9.0 的 releaseHandshake 释放锁逻辑。
-  const tls = new Tls13Client(hs.reader, hs.writer, {
-    serverName: targetHost,
-    onClose: () => closeQuietly(sock),
-  });
-  try {
-    await withTimeout(tls.handshake(), TLS13_HANDSHAKE_TIMEOUT_MS, "tls13 handshake timeout (" + p.host + ":" + p.port + ")");
-  } catch (err) {
-    closeQuietly(sock);
-    throw err;
-  }
+  const { tls, reader, writer } = conn;
   const onTlsAbort = () => tls.close();
   signal?.addEventListener("abort", onTlsAbort, { once: true });
-  const writer: { write(chunk: Uint8Array): Promise<void> } = {
-    write: (chunk: Uint8Array) => tls.write(chunk),
-  };
-  const reader = new ByteBufReader({
-    read: () => tls.read().then((v) => (v === null ? { done: true, value: undefined } : { done: false, value: v })),
-    releaseLock: () => {},
-  });
-
-  const headers: Record<string, string> = {};
-  const inHeaders = new Headers(init.headers ?? {});
-  inHeaders.forEach((v, k) => {
-    const lk = k.toLowerCase();
-    if (["host", "content-length", "transfer-encoding", "connection", "keep-alive"].includes(lk)) return;
-    headers[k] = v;
-  });
-
-  const bodyBytes = await encodeBody(init.body);
   try {
+    const headers: Record<string, string> = {};
+    const inHeaders = new Headers(init.headers ?? {});
+    inHeaders.forEach((v, k) => {
+      const lk = k.toLowerCase();
+      if (["host", "content-length", "transfer-encoding", "connection", "keep-alive"].includes(lk)) return;
+      headers[k] = v;
+    });
+
+    const bodyBytes = await encodeBody(init.body);
     await withTimeout(
       writeTunnelRequest(writer, { method: init.method ?? "GET", url, headers, body: bodyBytes }),
       CONNECT_TIMEOUT_MS,
       "write request timeout",
     );
-    const headBlock = await reader.readHeaderBlock();
-    const head = parseResponseHeadBlock(headBlock);
-    const shape = determineBodyShape(head.headers);
+    // 响应头：1xx 过渡响应跳过（未用 Expect: 100-continue，仅防御性兼容）
+    let head: ResponseHead;
+    for (;;) {
+      const headBlock = await reader.readHeaderBlock();
+      markBytes?.();
+      head = parseResponseHeadBlock(headBlock);
+      if (head.status < 100 || head.status >= 200) break;
+    }
+    const method = init.method ?? "GET";
+    const shape = isBodylessStatus(method, head.status)
+      ? { chunked: false, contentLength: 0 }
+      : determineBodyShape(head.headers);
+    const allowsReuse = responseAllowsReuse(head) && (shape.chunked || shape.contentLength !== null);
     const outHeaders = new Headers();
     for (const [k, v] of Object.entries(head.headers)) {
-      if (["content-length", "transfer-encoding", "connection", "keep-alive"].includes(k)) continue;
+      if (["content-length", "transfer-encoding", "connection", "keep-alive", "proxy-connection"].includes(k)) continue;
       outHeaders.set(k, v);
     }
-    const cleanup = () => {
+    outHeaders.set("x-vproxy-conn", warm ? "warm" : "cold");
+
+    let settled = false; // 防止 finish/cancel 双重触发导致连接被二次处置
+    const cleanup = (bodyReusable: boolean) => {
+      if (settled) return;
+      settled = true;
       signal?.removeEventListener("abort", onTlsAbort);
-      tls.close();
+      const reusable = bodyReusable && allowsReuse && !signal?.aborted;
+      connPool.release(conn, reusable);
     };
     const body = makeBodyStream(reader, shape, cleanup);
     return new Response(body, { status: head.status, statusText: head.reason, headers: outHeaders });
   } catch (err) {
     signal?.removeEventListener("abort", onTlsAbort);
-    tls.close();
+    connPool.discard(conn);
     throw err;
   }
 }
@@ -322,20 +383,22 @@ async function encodeBody(body: BodyInit | null | undefined): Promise<Uint8Array
   return new Uint8Array(await new Response(body).arrayBuffer());
 }
 
-/** 管理端点/健康巡检用：测试单个代理连通性（对 Gemini API 发起 GET 探测） */
-export async function testProxy(proxyUrl: string, timeoutMs = 10_000): Promise<{ ok: boolean; latency_ms: number; error?: string }> {
+/** 管理端点/健康巡检用：测试单个代理连通性（对 Gemini API 发起 GET 探测）。
+ * v2.2：探测目标改为 ?pageSize=1（响应体 ~1KB）并完整读取 —— 响应体精确消费后
+ * 连接归还复用池，紧随其后的探测/业务请求即可暖连接命中（runs=2 连测即验证）。 */
+export async function testProxy(proxyUrl: string, timeoutMs = 10_000): Promise<{ ok: boolean; latency_ms: number; error?: string; body_bytes?: number }> {
   const p = parseProxyUrl(proxyUrl);
   if (!p) return { ok: false, latency_ms: 0, error: "invalid proxy url" };
   const started = Date.now();
   try {
     const resp = await viaProxy(
       p,
-      "https://generativelanguage.googleapis.com/v1beta/models",
+      "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1",
       { method: "GET" },
       AbortSignal.timeout(timeoutMs),
     );
-    await resp.body?.cancel();
-    return { ok: resp.status < 500, latency_ms: Date.now() - started, error: resp.status >= 500 ? "HTTP " + resp.status : undefined };
+    const body = await resp.text(); // 完整消费 → 连接回池（复用判定生效）
+    return { ok: resp.status < 500, latency_ms: Date.now() - started, error: resp.status >= 500 ? "HTTP " + resp.status : undefined, body_bytes: body.length };
   } catch (err) {
     return { ok: false, latency_ms: Date.now() - started, error: err instanceof Error ? err.message : String(err) };
   }

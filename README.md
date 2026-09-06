@@ -4,6 +4,28 @@
 > 专为 Cloudflare Workers（免费计划即可）设计。转换层逻辑与原项目对齐，去掉了 reCAPTCHA 突破、
 > TLS 指纹伪装、mihomo 代理内核等 Workers 沙箱无法实现的部分。
 >
+> **v2.2.0 更新（HTTP/1.1 Keep-Alive 连接复用池：同代理同上游的后续请求跳过全部握手）**：
+> ✅ **实测平均每请求节省约 1 秒**（8 个免费代理对 Google 实测：冷 350~3637ms → 暖 148~299ms，
+> 平均节省 1048ms，慢握手代理最高节省 3430ms）。v2.1 之前每个请求都完整重跑
+> 「TCP connect → SOCKS5/CONNECT 代理握手（1-2 RTT）→ TLS 1.3 完整握手（1-2 RTT + 4-6KB
+> 证书传输）」，这套连接建立开销占免费代理单请求延迟的 60-80%。
+> v2.2.0 的解法（`src/proxy/connpool.ts`）：按 **(代理, 目标 host:port)** 把「响应体已精确读完」的
+> TLS 连接缓存进 isolate 内存复用池：
+> ① **回池条件严格**：HTTP/1.1 且未收到 `Connection: close`、响应体 Content-Length/chunked 精确
+> 定界并完整消费（EOF 定界不回池）；空闲 45s / 总寿命 10min / 复用 200 次即退役；池容 12 条 LRU；
+> ② **死连接自愈**：免费代理静默掐断空闲隧道时，复用请求若在「未收到任何响应字节」即失败，
+> 自动丢弃该连接并用冷路径重试一次（浏览器同款安全重试规则，POST 不会重复计费）；
+> 收到过（哪怕不完整的）响应字节则如实上抛，绝不盲目重试；
+> ③ **竞速联动**：有暖连接的节点排到候选最前（零握手成本必然最先胜出）；响应头新增
+> `x-vproxy-conn: warm|cold` 便于观测；`/admin/health` 新增 `conn_pool` 字段（空闲连接数/暖代理数）；
+> ④ **健壮性顺带增强**：1xx 过渡响应跳过、HEAD/204/304 空体定界（防挂起）、
+> `proxy-connection: close` 同样禁复用。
+>
+> **v2.1.0 更新（握手与读写性能优化）**：TLS 1.3 握手中相互独立的 WebCrypto 操作全部
+> Promise.all 并行化（密钥调度/证书链验签/transcript 哈希/CV+Finished 验证）；证书链验签结论
+> isolate 级缓存（Google 链约 90 天不变，缓存命中握手 CPU 再降 32%）；大请求体分记录并行
+> 加密 + 合并单次底层写（256 记录/批）；HTTP 头+体合并单次写。
+>
 > **v2.0.0 更新（TLS Handshake Failed 根因修复：纯 JS 实现 TLS 1.3，代理隧道在 Workers 上真正可用）**：
 > ✅ **经代理访问 HTTPS 上游彻底打通**。v1.9.1 的结论（workerd `startTls()` 在已承载代理握手流量的
 > socket 上 100% 报 `TLS Handshake Failed.`）经部署到真实边缘的诊断 Worker 分步复现确认属实：

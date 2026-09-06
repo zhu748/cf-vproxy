@@ -20,7 +20,9 @@ export interface ResponseHead {
 
 /** 写出 HTTP/1.1 请求（Content-Length 固定，body 必须已知长度）
  * v2.0：writer 放宽为结构性接口 —— 既接受 WritableStreamDefaultWriter，也接受
- * tls13 客户端的 write 适配器（代理隧道上的纯 JS TLS 层）。 */
+ * tls13 客户端的 write 适配器（代理隧道上的纯 JS TLS 层）。
+ * v2.2：默认 Connection: keep-alive（连接复用池的请求侧前提）；服务器若不支持
+ * 会回 Connection: close，响应侧据此不回池，行为与 v2.1 及更早完全兼容。 */
 export async function writeTunnelRequest(
   writer: { write(chunk: Uint8Array): Promise<void> },
   req: TunnelRequest,
@@ -39,7 +41,7 @@ export async function writeTunnelRequest(
     lines.push(k + ": " + v);
   }
   lines.push("Content-Length: " + req.body.length);
-  lines.push("Connection: close");
+  lines.push("Connection: keep-alive");
   const head = new TextEncoder().encode(lines.join("\r\n") + "\r\n\r\n");
   // v2.1：头+体合并为单次 write —— tls13 层对单次写入做并行加密分批，
   // 少一次底层写调用，TCP 打包也更好（头体常落在同一批次）
@@ -79,11 +81,29 @@ export function determineBodyShape(headers: Record<string, string>): BodyShape {
   return { chunked: false, contentLength: null };
 }
 
-/** 构造响应体流：从 ByteBufReader 读取（reader 中可能已缓冲头部之后的剩余字节） */
+/** 无响应体语义：HEAD 响应与 204/304 状态码（RFC 9110：无论是否存在 Content-Length 都没有 body） */
+export function isBodylessStatus(method: string, status: number): boolean {
+  return method.toUpperCase() === "HEAD" || status === 204 || status === 304;
+}
+
+/** 响应是否允许连接复用：非 1xx 终态、HTTP/1.1+、未声明 Connection: close
+ * v2.2：连接池的响应侧判定 */
+export function responseAllowsReuse(head: ResponseHead): boolean {
+  if (head.status >= 100 && head.status < 200) return false;
+  const conn = (head.headers["connection"] ?? "").toLowerCase();
+  if (conn.includes("close")) return false;
+  const proxyConn = (head.headers["proxy-connection"] ?? "").toLowerCase();
+  if (proxyConn.includes("close")) return false;
+  return true;
+}
+
+/** 构造响应体流：从 ByteBufReader 读取（reader 中可能已缓冲头部之后的剩余字节）
+ * v2.2：cleanup 回调携带 reusable 标志 —— 响应体被完整消费且定界精确（CL/chunked
+ * 自然终止）时为 true，调用方可据此把连接归还复用池；中途出错/取消/EOF 定界为 false。 */
 export function makeBodyStream(
   reader: ByteBufReader,
   shape: BodyShape,
-  cleanup: () => void,
+  cleanup: (reusable: boolean) => void,
 ): ReadableStream<Uint8Array> {
   let finished = false;
   let chunkRemaining = 0;
@@ -97,7 +117,7 @@ export function makeBodyStream(
     } catch {
       // already closed
     }
-    cleanup();
+    cleanup(shape.contentLength !== null || shape.chunked);
   };
 
   return new ReadableStream<Uint8Array>({
@@ -155,7 +175,7 @@ export function makeBodyStream(
         controller.enqueue(data);
       } catch (err) {
         finished = true;
-        cleanup();
+        cleanup(false);
         try {
           controller.error(err);
         } catch {
@@ -164,7 +184,7 @@ export function makeBodyStream(
       }
     },
     cancel() {
-      cleanup();
+      cleanup(false);
     },
   });
 }

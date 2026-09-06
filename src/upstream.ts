@@ -16,6 +16,9 @@ export interface HandlerCtx {
   pool: ProxyPool | null;
   waitUntil: (p: Promise<unknown>) => void;
   clientKey: string;
+  /** v2.2：最近一次出站调用实际使用的出口（含 [warm] 复用标记）；
+   * 处理器重建 Response 时会丢失 __via，route() 用此字段统一回填进请求日志 */
+  lastVia?: string;
 }
 
 export const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
@@ -77,7 +80,12 @@ export async function callGemini(ctx: HandlerCtx, model: string, action: string,
     ctx.waitUntil,
     ctx.cfg.racing,
   );
-  (response as Response & { __via?: string }).__via = via;
+  // v2.2：via 携带连接复用标记（viaProxy 响应头 x-vproxy-conn），日志/面板可直接观测暖连接命中；
+  // 同时写入 ctx.lastVia —— 处理器重建 Response 丢失 __via 时由 route() 统一回填
+  const connKind = response.headers.get("x-vproxy-conn");
+  const viaTagged = connKind === "warm" ? via + " [warm]" : via;
+  (response as Response & { __via?: string }).__via = viaTagged;
+  ctx.lastVia = viaTagged;
   return response;
 }
 

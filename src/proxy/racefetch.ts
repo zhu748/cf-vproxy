@@ -40,12 +40,29 @@ import {
   selectCandidates,
 } from "../racing.ts";
 import { viaProxy, type ProxyPool } from "./proxyfetch.ts";
+import { connPool } from "./connpool.ts";
 
 export type { ProxyPool };
 
 const clampNum = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// v2.2：暖连接优先 —— 池内有可用空闲连接的代理排到候选最前（保持其余相对次序不变）。
+// 暖连接请求跳过 TCP/代理/TLS 全部握手，几乎必然最先胜出；无暖连接时原样返回零开销。
+function warmFirst<T extends { raw: string }>(cands: T[]): T[] {
+  let anyWarm = false;
+  for (const c of cands) {
+    if (connPool.isWarm(c.raw)) {
+      anyWarm = true;
+      break;
+    }
+  }
+  if (!anyWarm) return cands;
+  const warm = cands.filter((c) => connPool.isWarm(c.raw));
+  const cold = cands.filter((c) => !connPool.isWarm(c.raw));
+  return [...warm, ...cold];
+}
 
 export interface UpstreamResult {
   response: Response;
@@ -60,7 +77,8 @@ function healthyOrder(entries: ProxyPool["entries"]): ProxyPool["entries"] {
   const cooling = entries.filter((e) => isCooling(proxyHealth(e.raw), now));
   const score = (e: { raw: string }) => healthScore(proxyHealth(e.raw), now);
   ok.sort((a, b) => score(b) - score(a));
-  return [...ok, ...cooling];
+  // v2.2：暖连接节点优先（跳过全部握手的零成本尝试）
+  return warmFirst([...ok, ...cooling]);
 }
 
 let rrCursor = 0;
@@ -208,7 +226,8 @@ export async function raceUpstream(
   waitUntil: (p: Promise<unknown>) => void,
 ): Promise<UpstreamResult> {
   const now = Date.now();
-  const candidates = selectCandidates(pool.entries, healthMapSnapshot(), racing, now);
+  // v2.2：暖连接优先参与竞速（首个立即发出的候选优先选中零握手成本的节点）
+  const candidates = warmFirst(selectCandidates(pool.entries, healthMapSnapshot(), racing, now));
   if (candidates.length <= 1) {
     // 唯一候选：直接单发（失败不接力 —— 候选表已含全部健康节点）
     if (candidates.length === 1) {
