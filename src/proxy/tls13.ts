@@ -84,6 +84,20 @@ function eqBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+/** RFC 8446 §12 TLS alert 描述码 → 可读名（诊断用；未知码返回 hex） */
+export function alertDescription(code: number): string {
+  const names: Record<number, string> = {
+    0: "close_notify", 10: "unexpected_message", 40: "handshake_failure",
+    43: "no_application_protocol", 47: "illegal_parameter", 48: "unknown_ca",
+    49: "access_denied", 50: "decode_error", 51: "decrypt_error",
+    70: "protocol_version", 71: "internal_error", 86: "inappropriate_fallback",
+    109: "missing_extension", 110: "unsupported_extension", 112: "unrecognized_name",
+    113: "bad_certificate_status_response", 115: "unknown_psk_identity",
+    116: "certificate_required", 120: "bad_record_mac",
+  };
+  return names[code] ?? ("unknown_0x" + code.toString(16));
+}
+
 // ---------------------------------------------------------------------------
 // WebCrypto 基元
 // ---------------------------------------------------------------------------
@@ -557,6 +571,13 @@ export class Tls13Client {
     const len = (head[3] << 8) | head[4]; // [type(1)][version(2)][length(2)]
     if (len > MAX_RECORD + 256) this.fail("record too large: " + len);
     const payload = await this.reader.readExact(len);
+    if (head[0] === 0x15 && payload.length >= 2) {
+      // 明文 alert（ServerHello 前）：带出描述码，定位关键（如 40=handshake_failure、112=unrecognized_name）
+      this.fail(
+        "alert before ServerHello: " + alertDescription(payload[1]) +
+          " (level " + payload[0] + ", code " + payload[1] + ")",
+      );
+    }
     return { type: head[0], payload };
   }
 

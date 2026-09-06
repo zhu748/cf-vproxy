@@ -42,7 +42,7 @@ import { matchApiRoute, NEEDS_UPSTREAM, type ApiRoute } from "./router.ts";
 import { acquireSlot, bodyLimitViolation } from "./gate.ts";
 import { withFakeVariants } from "./fakestream.ts";
 
-const VERSION = "2.2.0";
+const VERSION = "2.2.1";
 
 function corsHeaders(): Record<string, string> {
   return {

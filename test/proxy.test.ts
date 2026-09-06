@@ -198,6 +198,13 @@ test("socks4 connect: 4a frame for domain target", () => {
   const host = "generativelanguage.googleapis.com";
   assert.equal(dec(f.subarray(9, 9 + host.length)), host);
   assert.equal(f[f.length - 1], 0);
+  // v2.2.1 回归断言：总长必须精确等于 8 头 + 0 userid + 1 NUL + 域名 + 1 NUL。
+  // 旧版此处多 1 字节尾零，被代理当作隧道净荷转发 → TLS 记录流错位 →
+  // Google 回 protocol_version Alert（实测字节级对照 curl 帧定位）。
+  assert.equal(f.length, 8 + 1 + host.length + 1);
+  // 带 userid 的 4a 帧同样校验精确长度
+  const g = buildSocks4ConnectRequest("example.com", 80, "bob");
+  assert.equal(g.length, 8 + 3 + 1 + 11 + 1);
 });
 
 test("socks4 connect: bad port throws", () => {

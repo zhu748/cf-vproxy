@@ -146,7 +146,11 @@ export function buildSocks4ConnectRequest(host: string, port: number, userId?: s
   }
   const h = new TextEncoder().encode(host);
   if (h.length > 255) throw new Error("socks4a: host too long");
-  const out = new Uint8Array(9 + uid.length + 1 + h.length + 1);
+  // v2.2.1 修复：分配长度此前写 9 + uid + 1 + host + 1（头长误算为 9），
+  // 实际写入 8 字节头 + uid + NUL + host + NUL —— 多出的 1 字节零会被
+  // 代理当作隧道净荷转发给目标，TLS 记录流错位（实测 Google 回
+  // protocol_version Alert；curl 的标准 43 字节帧同节点可通）。
+  const out = new Uint8Array(8 + uid.length + 1 + h.length + 1);
   let off = 0;
   out[off++] = SOCKS4_VER;
   out[off++] = 0x01;
