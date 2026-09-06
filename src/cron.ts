@@ -18,6 +18,10 @@ import { flushIfDue } from "./usage.ts";
 
 export const LAST_SWEEP_KEY = "cron:last_sweep_at";
 export const LAST_KEEPALIVE_KEY = "cron:last_keepalive_at";
+// v2.5.0：cron 心跳时间戳 —— 每跳（任务完成后）写入，面板/接口可据此确认
+// 定时拉取链路是否活着（部署方最常问“为什么节点数没更新”，先分清“cron 没跑”
+// 还是“拉了但没变化”）。
+export const LAST_RUN_KEY = "cron:last_run_at";
 
 const KEEPALIVE_TIMEOUT_MS = 30_000; // 对齐原项目 requestTimeout
 // sweepDue / keepaliveDue / subscriptionDue 纯逻辑判定在 src/racing.ts（无 Workers 依赖，可单测）；此处 re-export
@@ -93,22 +97,28 @@ export interface ScheduledReport {
   subscription: { refreshed: boolean; proxies?: number; skipped?: number; skipped_reason?: string } | null;
 }
 
-/** scheduled 事件入口：健康巡检 + 订阅刷新 + keepalive ping + 统计落盘 */
-export async function runScheduledTasks(env: Env): Promise<ScheduledReport> {
+/** scheduled 事件入口：健康巡检 + 订阅刷新 + keepalive ping + 统计落盘 + 心跳
+ *  v2.5.0 opts.light：跳过健康巡检（手动触发场景用：巡检批量测代理可能跑分钟级，
+ *  /admin/cron/run 只需验证订阅拉取/保活/落盘链路，批量巡检走 /admin/health/sweep） */
+export async function runScheduledTasks(env: Env, opts?: { light?: boolean }): Promise<ScheduledReport> {
   const cfg = await loadConfig(env, true);
   const now = Date.now();
   const report: ScheduledReport = { sweep: null, sweep_skipped: false, keepalive: null, subscription: null };
 
-  // 1. 健康巡检（KV 时间戳控制节奏）
-  let lastSweepAt = 0;
-  try {
-    lastSweepAt = Number(await env.VPROXY_KV.get(LAST_SWEEP_KEY)) || 0;
-  } catch {
-    lastSweepAt = 0;
-  }
-  if (sweepDue(cfg, lastSweepAt, now)) {
-    report.sweep = await runHealthSweep(env, cfg).catch(() => null);
-    await env.VPROXY_KV.put(LAST_SWEEP_KEY, String(now)).catch(() => {});
+  // 1. 健康巡检（KV 时间戳控制节奏；light 模式跳过）
+  if (!opts?.light) {
+    let lastSweepAt = 0;
+    try {
+      lastSweepAt = Number(await env.VPROXY_KV.get(LAST_SWEEP_KEY)) || 0;
+    } catch {
+      lastSweepAt = 0;
+    }
+    if (sweepDue(cfg, lastSweepAt, now)) {
+      report.sweep = await runHealthSweep(env, cfg).catch(() => null);
+      await env.VPROXY_KV.put(LAST_SWEEP_KEY, String(now)).catch(() => {});
+    } else {
+      report.sweep_skipped = true;
+    }
   } else {
     report.sweep_skipped = true;
   }
@@ -155,5 +165,7 @@ export async function runScheduledTasks(env: Env): Promise<ScheduledReport> {
   await flushIfDue(env).catch(() => {});
   await flushHealthIfDue(env).catch(() => {});
   await flushMetrics(env).catch(() => {});
+  // v2.5.0：心跳落盘（任务完成后写 —— 心跳存在 = cron 链路端到端活着）
+  await env.VPROXY_KV.put(LAST_RUN_KEY, String(now)).catch(() => {});
   return report;
 }

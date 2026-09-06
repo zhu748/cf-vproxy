@@ -25,7 +25,7 @@ import type { VProxyConfig } from "../types.ts";
 import { allHealthRecords, averageLatency, ensureHealthLoaded, flushHealthNow, healthMapSnapshot, poolBreakerSnapshot, recordProxyFailure, recordProxySuccess, resetHealth, sanitizeRacingConfig } from "../racing.ts";
 import { getMetrics, renderPrometheus } from "../metrics.ts";
 import { getPromptDiagnostics, clearPromptDiagnostics } from "../promptpolicy.ts";
-import { runHealthSweep, LAST_SWEEP_KEY } from "../cron.ts";
+import { runHealthSweep, LAST_SWEEP_KEY, LAST_RUN_KEY } from "../cron.ts";
 import { sanitizeConfig } from "../config.ts";
 
 function maskKey(k: string): string {
@@ -179,6 +179,32 @@ export async function handleAdmin(
     // v2.2.0：连接复用池观测（isolate 内存级；warm 连接 = 下一个请求可跳过全部握手）
     const { connPool } = await import("../proxy/connpool.ts");
     const connStats = connPool.stats();
+    // v2.5.0：订阅状态（跨 isolate 的 KV 视角）+ cron 心跳 —— 面板「代理」页据此展示
+    // 节点数 / 上次拉取 / 下次自动拉取倒计时，以及定时任务链路是否活着。
+    let subscription: Record<string, unknown> | null = null;
+    let cron_last_run_at = 0;
+    let maxProxies = 1000;
+    try {
+      // 动态导入：proxyfetch 依赖 cloudflare:sockets，静态引入会把 Node 测试一起炸掉
+      const { SUB_CACHE_KEY, MAX_PROXIES } = await import("../proxy/proxyfetch.ts");
+      maxProxies = MAX_PROXIES;
+      const subCache = (await envVars.VPROXY_KV.get(SUB_CACHE_KEY, "json")) as { at?: number; proxies?: unknown[]; skipped?: number } | null;
+      if (subCache && Array.isArray(subCache.proxies)) {
+        const intervalMs = Math.max(5, cfg.subscription_refresh_minutes) * 60_000;
+        subscription = {
+          configured: !!cfg.subscription,
+          nodes: subCache.proxies.length,
+          cached_at: typeof subCache.at === "number" ? subCache.at : 0,
+          age_sec: typeof subCache.at === "number" ? Math.max(0, Math.round((now - subCache.at) / 1000)) : 0,
+          next_refresh_sec: typeof subCache.at === "number" ? Math.max(0, Math.round((subCache.at + intervalMs - now) / 1000)) : 0,
+          refresh_minutes: cfg.subscription_refresh_minutes,
+          max_proxies: maxProxies,
+        };
+      }
+      cron_last_run_at = Number(await envVars.VPROXY_KV.get(LAST_RUN_KEY)) || 0;
+    } catch {
+      // KV 读失败不阻塞健康度返回
+    }
     return json({
       racing: cfg.racing,
       health: allHealthRecords(),
@@ -186,7 +212,9 @@ export async function handleAdmin(
       sticky,
       pool_breaker: poolBreakerSnapshot(),
       conn_pool: { idle_conns: connStats.idleConns, warm_proxies: connStats.warmProxies, conns: connStats.conns },
-      _hint: "健康度为 isolate 内存 + KV 快照（20s 批量刷盘）；score 由成功率/延迟/连败/粘性综合计算。pool_breaker.open=true 时代理池被熔断（Workers 平台 TLS 过隧道不可用 / 全池连败），请求自动回退直连。conn_pool 为 v2.2 Keep-Alive 复用池（同 isolate 内后续请求跳过 TCP/代理/TLS 握手）",
+      subscription,
+      cron: { last_run_at: cron_last_run_at, heartbeat_minutes: 15 },
+      _hint: "健康度为 isolate 内存 + KV 快照（20s 批量刷盘）；score 由成功率/延迟/连败/粘性综合计算。pool_breaker.open=true 时代理池被熔断，请求自动回退直连。conn_pool 为 Keep-Alive 复用池。subscription/cron 为 v2.5.0 订阅自动拉取观测（节点数上限 max_proxies；cron.last_run_at 距今 >15 分钟 = 定时任务未跑，检查 wrangler triggers）",
     });
   }
 
@@ -210,6 +238,16 @@ export async function handleAdmin(
     }));
     await envVars.VPROXY_KV.put(LAST_SWEEP_KEY, String(Date.now())).catch(() => {});
     return json({ ok: true, report });
+  }
+
+  // ---- v2.5.0：手动执行一轮定时任务（light：订阅拉取 + 保活 + 落盘 + 心跳，跳过批量巡检）
+  // 用于验证 Cron 链路（尤其「订阅是否到点自动拉取」），免等下一个 cron 跳。批量巡检用 /admin/health/sweep。
+  if (req.method === "POST" && (path === "/admin/cron/run" || path === "/admin/cron/run/")) {
+    const { runScheduledTasks } = await import("../cron.ts");
+    const report = await runScheduledTasks(envVars, { light: true }).catch((e: unknown) => ({
+      error: e instanceof Error ? e.message : String(e),
+    }));
+    return json({ ok: true, mode: "light", report, _hint: "与 cron 每跳同一实现但跳过批量巡检：验证订阅拉取（到点才真正拉，否则 skipped_reason=cache_fresh）/保活/统计落盘。批量巡检走 /admin/health/sweep" });
   }
 
   // ---- 请求指标（原项目 metrics.go 语义；?format=prometheus 返回文本格式） ----

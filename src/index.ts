@@ -119,6 +119,7 @@ function serviceInfo(): Response {
         "GET /admin/logs",
         "POST /admin/logs/clear",
         "POST /admin/proxies/refresh",
+        "POST /admin/cron/run (手动执行一轮定时任务，light 模式)",
         "POST /admin/proxy/test",
         "POST /admin/proxies/test-all",
         "GET /admin/health",

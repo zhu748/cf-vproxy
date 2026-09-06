@@ -234,7 +234,18 @@ const PANEL_HTML = `
 
 <!-- ===== 代理 ===== -->
 <section class="view" id="v-proxy">
-  <div class="card">
+  <div class="card" id="sub-card">
+    <div class="row" style="justify-content:space-between;margin-bottom:12px">
+      <h3 style="margin:0">订阅自动拉取</h3>
+      <div class="row">
+        <button class="btn ghost sm" id="sub-run-cron">立即执行定时任务</button>
+        <button class="btn sm" id="sub-refresh">立即拉取订阅</button>
+      </div>
+    </div>
+    <div class="grid g4" id="sub-stats"><div class="empty">加载中…</div></div>
+    <div class="hint" id="sub-hint" style="margin-top:8px">订阅按配置的周期由 Cron Triggers 自动拉取（wrangler.jsonc 已预置每 15 分钟一跳心跳，到点才真正拉取订阅）。</div>
+  </div>
+  <div class="card" style="margin-top:14px">
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
       <h3 style="margin:0">出站代理列表</h3>
       <div class="row">
@@ -465,6 +476,7 @@ $("logout-btn").onclick = function(){
 // ===== 页签 =====
 var LOADERS = {};
 function switchTab(name){
+  CUR_TAB = name;
   var tabs = document.querySelectorAll(".tab");
   for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle("on", tabs[i].getAttribute("data-v") === name);
   var views = document.querySelectorAll(".view");
@@ -744,12 +756,86 @@ $("px-test-all").onclick = function(){
     if (e.message !== "NEED_LOGIN") toast(e.message, "err");
   });
 };
+// ===== 代理页 =====
+// v2.5.0：订阅自动拉取观测（/admin/health 的 subscription + cron 字段）
+var SUB = null; // { nodes, age_sec, next_refresh_sec, refresh_minutes, max_proxies, cron_age_sec }
+var CUR_TAB = "dash";
+function fmtAge(sec){
+  if (sec == null) return "-";
+  if (sec < 90) return sec + " 秒";
+  if (sec < 5400) return Math.round(sec / 60) + " 分钟";
+  return Math.round(sec / 3600) + " 小时";
+}
+function renderSub(){
+  if (!SUB){
+    $("sub-stats").innerHTML = '<div class="empty">未配置订阅或暂无缓存 —— 在「配置」页填写订阅链接并保存后自动拉取</div>';
+    $("sub-hint").textContent = "订阅按配置周期由 Cron Triggers 自动拉取（wrangler.jsonc 预置每 15 分钟心跳，到点才真正拉取）。";
+    return;
+  }
+  var cronOk = SUB.cron_age_sec != null && SUB.cron_age_sec <= 1200; // 15 分钟心跳 + 5 分钟宽容
+  $("sub-stats").innerHTML =
+    statCard(String(SUB.nodes), "订阅节点数", "c-accent") +
+    statCard(fmtAge(SUB.age_sec) + "前", "上次拉取", "") +
+    statCard(fmtAge(SUB.next_refresh_sec), "下次自动拉取", "c-purple") +
+    statCard(SUB.cron_age_sec != null ? (cronOk ? fmtAge(SUB.cron_age_sec) + "前" : "未检测到") : "-", "Cron 心跳", cronOk ? "c-ok" : "c-warn");
+  var period = SUB.refresh_minutes >= 60 ? "每 " + (SUB.refresh_minutes / 60) + " 小时" : "每 " + SUB.refresh_minutes + " 分钟";
+  $("sub-hint").textContent = "节奏：" + period + "（面板「配置」页 subscription_refresh_minutes 可调，由 */15 Cron 心跳驱动到点拉取）；节点数上限 " + (SUB.max_proxies || 1000) + "。Cron 心跳超过 20 分钟未更新 = 定时任务未运行（查 Cloudflare 面板 Workers → Cron Events）。";
+}
+$("sub-refresh").onclick = function(){
+  var btn = this;
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+  api("/proxies/refresh", { method: "POST" }).then(function(j){
+    btn.disabled = false; btn.textContent = "立即拉取订阅";
+    toast("订阅已拉取：" + j.proxies + " 个节点，剔除 " + j.skipped_unsupported + " 个不支持", "ok", 4500);
+    LOADERS.proxy();
+  }).catch(function(e){
+    btn.disabled = false; btn.textContent = "立即拉取订阅";
+    if (e.message !== "NEED_LOGIN") toast("拉取失败：" + e.message, "err", 5000);
+  });
+};
+$("sub-run-cron").onclick = function(){
+  var btn = this;
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+  api("/cron/run", { method: "POST" }).then(function(j){
+    btn.disabled = false; btn.textContent = "立即执行定时任务";
+    var sub = (j.report && j.report.subscription) || {};
+    toast("定时任务已执行（light）：" + (sub.refreshed ? "订阅已刷新，" + (sub.proxies || 0) + " 节点" : "订阅未到期（" + (sub.skipped_reason || "cache_fresh") + "）"), "ok", 5000);
+    LOADERS.proxy();
+  }).catch(function(e){
+    btn.disabled = false; btn.textContent = "立即执行定时任务";
+    if (e.message !== "NEED_LOGIN") toast("执行失败：" + e.message, "err", 5000);
+  });
+};
 LOADERS.proxy = function(){
   api("/config").then(function(j){
     PX = (j.proxies || []).slice();
     renderPx();
   }).catch(function(e){ if (e.message !== "NEED_LOGIN") toast("加载失败：" + e.message, "err"); });
+  api("/health").then(function(j){
+    var s = j.subscription;
+    var cronAt = (j.cron && j.cron.last_run_at) || 0;
+    var cronAge = cronAt ? Math.max(0, Math.round((Date.now() - cronAt) / 1000)) : null;
+    SUB = s
+      ? { nodes: s.nodes, age_sec: s.age_sec, next_refresh_sec: s.next_refresh_sec, refresh_minutes: s.refresh_minutes, max_proxies: s.max_proxies, cron_age_sec: cronAge }
+      : { nodes: 0, age_sec: 0, next_refresh_sec: 0, refresh_minutes: 0, max_proxies: 0, cron_age_sec: cronAge };
+    renderSub();
+  }).catch(function(){ /* /health 失败不影响代理列表渲染 */ });
 };
+// 订阅状态每秒跳动（仅代理页可见时；秒级字段在 90s 内展示秒，开销极小）
+setInterval(function(){
+  if (!SUB || !document.getElementById("v-proxy").classList.contains("on")) return;
+  SUB.age_sec += 1;
+  if (SUB.next_refresh_sec > 0) SUB.next_refresh_sec -= 1;
+  if (SUB.cron_age_sec != null) SUB.cron_age_sec += 1;
+  renderSub();
+}, 1000);
+// v2.5.0：面板数据 60 秒自动刷新（页面可见且无输入焦点时 —— 不打断编辑）
+setInterval(function(){
+  if (document.visibilityState !== "visible") return;
+  var ae = document.activeElement;
+  if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return;
+  if (LOADERS[CUR_TAB]) LOADERS[CUR_TAB]();
+}, 60000);
 
 // ===== 竞速页 =====
 var HEALTH = null; // /admin/health 缓存

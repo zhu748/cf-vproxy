@@ -24,8 +24,11 @@ import {
 import { httpConnectHandshake, socks4Handshake, socks5Handshake } from "./tunnel.ts";
 import { Tls13Client, invalidateSessionTicket } from "./tls13.ts";
 
-const SUB_CACHE_KEY = "proxy_cache";
-const MAX_PROXIES = 200;
+export const SUB_CACHE_KEY = "proxy_cache";
+// v2.5.0：200 → 1000。旧值把 375 节点的订阅硬截断到 200（用户实测发现：
+// 源在增长但池子永远 200）。KV 值上限 25MiB，1000 节点（~50B/条）仅 ~50KB，
+// 健康快照同量级，均远在限制内；巡检「最久未测优先」轮转可覆盖全池。
+export const MAX_PROXIES = 1000;
 const CONNECT_TIMEOUT_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const TLS13_HANDSHAKE_TIMEOUT_MS = 12_000;
@@ -34,9 +37,10 @@ const TLS13_HANDSHAKE_TIMEOUT_MS = 12_000;
 // 顺序模式（单节点 / 关竞速）没有任何兜底，客户端不断开就一直挂着。
 // 120s 足够宽容：Gemini 非流式 + 深度思考的长生成通常也在 120s 内返回头部。
 const RESPONSE_HEAD_TIMEOUT_MS = 120_000;
-// v2.4：订阅拉取超时 10s → 20s：免费托管平台（Render 等）冷启动常态 30s+，
-// 10s 必失败；20s 至少能在实例温热时一次成功（cron 每 15 分钟一跳会持续保温）。
-const SUB_FETCH_TIMEOUT_MS = 20_000;
+// 订阅拉取超时：v2.4 10s→20s，v2.5.0 →45s。订阅源在 Render 免费实例上，
+// 15 分钟无流量即休眠，冷启动普遍 30s+；过短会打挂每小时首拉（下一次要再等
+// 一小时）。失败仅返回 null 保留旧缓存，不阻塞 cron 其余任务。
+const SUB_FETCH_TIMEOUT_MS = 45_000;
 
 // v2.4：共享编码器（补漏：encodeBody 此前每请求 new 一个 TextEncoder）
 const TE = new TextEncoder();

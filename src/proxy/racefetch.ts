@@ -6,7 +6,9 @@
 //   - 首个候选立即发出，之后每隔 hedge_delay_ms（或动态平均延迟）追加下一个候选，
 //     在飞数不超过 max_concurrent；
 //   - 任一候选拿到可用响应（2xx/3xx）即胜出，立即中止其余候选（AbortController 关闭底层 socket）；
-//   - 429 → 记录限流冷却（30s）+ 驱逐粘性，继续竞速（原项目 ratelimit 语义）；
+//   - 429 → 按体分类（v2.5.0）：单 IP 滑动窗口限流 → 冷却该节点（用上游 retry 提示
+//     时长）+ 驱逐粘性，继续竞速/接力；项目级**每日**配额（PerDay）→ 请求级硬错误
+//     立即透传（换节点无法绕过，继续接力只会烧更多配额）；
 //   - 5xx / 连接失败 / 握手失败 → 记录失败连败冷却，立即极速接力下一候选；
 //   - 其它 4xx（400/401/403 等）→ 请求级硬错误，与代理无关：直接返回该响应且不惩罚节点
 //     （对齐原项目「非重试错误不计入代理健康」）；
@@ -33,7 +35,8 @@ import {
   healthMapSnapshot,
   healthScore,
   isCooling,
-  isKeyLevelQuota429,
+  classify429Body,
+  type Quota429Class,
   proxyHealth,
   recordProxyFailure,
   recordProxyRateLimit,
@@ -66,21 +69,29 @@ export interface UpstreamResult {
   via: string;
 }
 
-/** v2.4.1：读入 429 响应体并区分「Key 级配额」与「节点级限流」，返回重建后的 Response。
- * 单 Key 架构下配额 429（GenerateRequestsPerDayPerProjectPerModel 等）与代理无关 ——
- * 继续竞速/接力只会用同一把 Key 烧更多配额（免费层 20 次/天/模型，竞速最多放大 ~8×）。
- * 体过大的异常 429 不读，按节点级处理（防御恶意代理构造巨型错误页打爆内存）。 */
-async function absorb429(resp: Response): Promise<{ resp: Response; keyQuota: boolean }> {
+/** v2.5.0：读入 429 响应体并分类（per-ip 窗口限流 / project 每日配额），返回重建后的 Response。
+ * 旧误判复盘：v2.4.1 把 "exceeded your current quota"/FreeTier/PerProject 一律判 Key 级
+ * 配额硬失败 —— 但该文案同时出现在单 IP 滑动窗口限流里（"Please retry in 20.46s"，
+ * ~20s 即恢复），且 RPM 型 quotaId 本身含 PerProject。配额无限 + 每 IP 独立窗口的
+ * 部署下，可轮转绕过的限流被直接透传给客户端。
+ * 体过大的异常 429 不读，按 per-ip 节点级处理（防御恶意代理构造巨型错误页打爆内存）。 */
+async function absorb429(resp: Response): Promise<{ resp: Response; cls: Quota429Class }> {
   const cl = Number(resp.headers.get("content-length") ?? "0");
-  if (Number.isFinite(cl) && cl > 65_536) return { resp, keyQuota: false };
+  if (Number.isFinite(cl) && cl > 65_536) return { resp, cls: { level: "per-ip" } };
   let body = "";
   try {
     body = await resp.text(); // 小体；完整消费后连接可回池
   } catch {
-    return { resp, keyQuota: false };
+    return { resp, cls: { level: "per-ip" } };
+  }
+  // Retry-After 头秒数作为 body 无提示时的冷却兑底
+  const hdrRetry = Number(resp.headers.get("retry-after"));
+  const cls = classify429Body(body);
+  if (cls.level === "per-ip" && cls.retryAfterSecs == null && Number.isFinite(hdrRetry) && hdrRetry > 0 && hdrRetry <= 300) {
+    cls.retryAfterSecs = hdrRetry;
   }
   const rebuilt = new Response(body, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
-  return { resp: rebuilt, keyQuota: isKeyLevelQuota429(body) };
+  return { resp: rebuilt, cls };
 }
 
 // ---------- 健康感知的轮换顺序模式 ----------
@@ -102,8 +113,8 @@ interface NodeAttempt {
   resp?: Response;
   error?: string;
   ms: number;
-  /** v2.4.1：本响应是 Key 级配额 429（与节点无关，不应继续接力/竞速） */
-  quota429?: boolean;
+  /** v2.5.0：本响应是 429 时的分类（per-ip 窗口限流 / project 每日配额） */
+  q429?: Quota429Class;
 }
 
 async function attemptOnce(p: { raw: string }, url: string, init: RequestInit): Promise<NodeAttempt> {
@@ -112,7 +123,7 @@ async function attemptOnce(p: { raw: string }, url: string, init: RequestInit): 
     const resp = await viaProxy(p as Parameters<typeof viaProxy>[0], url, init);
     if (resp.status === 429) {
       const r = await absorb429(resp);
-      return { resp: r.resp, ms: Date.now() - started, quota429: r.keyQuota };
+      return { resp: r.resp, ms: Date.now() - started, q429: r.cls };
     }
     return { resp, ms: Date.now() - started };
   } catch (err) {
@@ -138,7 +149,7 @@ async function retrySameNodeOnce(
     return second.resp;
   }
   if (second.resp) {
-    if (second.resp.status === 429) recordProxyRateLimit(p.raw);
+    if (second.resp.status === 429) recordProxyRateLimit(p.raw, Date.now(), second.q429?.retryAfterSecs);
     else recordProxyFailure(p.raw, "HTTP " + second.resp.status);
     errors.push("[" + p.raw + "] retry(" + reason + ") HTTP " + second.resp.status);
     void second.resp.body?.cancel().catch(() => {});
@@ -170,11 +181,12 @@ export async function rotateUpstream(
       return { response: r.resp, via: p.raw };
     }
     if (r.resp && r.resp.status === 429) {
-      // v2.4.1：Key 级配额 429 —— 与节点/代理无关，直接透传给客户端（Retry-After 一并带回），
-      // 不罚节点、不接力：继续换节点只是用同一把 Key 继续撞墙
-      if (r.quota429) return { response: r.resp, via: p.raw };
-      recordProxyRateLimit(p.raw);
-      errors.push("[" + p.raw + "] 429 Rate Limit");
+      // v2.5.0：仅项目级**每日**配额（PerDay）硬透传 —— 换节点无法绕过，继续接力
+      // 只会烧更多配额；其余（单 IP 窗口限流）冷却该节点后接力下一个（每个代理
+      // IP 有独立窗口，轮转即解）。冷却时长用上游 retry 提示（~20s 级），不再固定 30s。
+      if (r.q429?.level === "project") return { response: r.resp, via: p.raw };
+      recordProxyRateLimit(p.raw, Date.now(), r.q429?.retryAfterSecs);
+      errors.push("[" + p.raw + "] 429 Rate Limit" + (r.q429?.retryAfterSecs != null ? " (retry " + Math.ceil(r.q429.retryAfterSecs) + "s)" : ""));
       void r.resp.body?.cancel().catch(() => {});
       continue;
     }
@@ -213,6 +225,8 @@ interface AttemptResult {
   resp?: Response;
   ms: number;
   error?: string;
+  /** v2.5.0：429 窗口限流时上游明示的重试秒数（供 onResult 落节点冷却） */
+  retryAfterSecs?: number;
 }
 
 function classifyStatus(status: number): AttemptKind {
@@ -228,11 +242,12 @@ async function runAttempt(p: { raw: string }, url: string, init: RequestInit, si
     const resp = await viaProxy(p as Parameters<typeof viaProxy>[0], url, init, signal);
     const ms = Date.now() - started;
     if (resp.status === 429) {
-      // v2.4.1：Key 级配额 429 按请求级硬错误处理 —— 立即胜出返回客户端并中止
-      // 其余在飞候选（它们正在用同一把 Key 继续烧配额）；不计节点惩罚（节点无辜）
+      // v2.5.0：项目级**每日**配额（PerDay）才按请求级硬错误 —— 立即胜出返回客户端
+      // 并中止在飞候选（换节点无法绕过，继续烧只是浪费）；单 IP 窗口限流走 ratelimit：
+      // 计节点冷却（onResult）后继续接力其他节点（各代理 IP 独立窗口，轮转即解）。
       const r = await absorb429(resp);
-      if (r.keyQuota) return { kind: "hard", resp: r.resp, ms };
-      return { kind: "ratelimit", resp: r.resp, ms };
+      if (r.cls.level === "project") return { kind: "hard", resp: r.resp, ms };
+      return { kind: "ratelimit", resp: r.resp, ms, retryAfterSecs: r.cls.retryAfterSecs };
     }
     const kind = classifyStatus(resp.status);
     if (kind === "ok") recordProxySuccess(p.raw, ms);
@@ -270,9 +285,10 @@ export async function raceUpstream(
         const kind = classifyStatus(r.resp.status);
         if (kind === "ok") recordProxySuccess(only.raw, r.ms);
         else if (kind === "ratelimit") {
-          // v2.4.1：Key 级配额 429 —— 直接透传，不冷却节点、不做节点内重试
-          if (r.quota429) return { response: r.resp, via: only.raw };
-          recordProxyRateLimit(only.raw);
+          // v2.5.0：仅项目级每日配额硬透传；单 IP 窗口限流 → 冷却该节点（唯一候选
+          // 无节点可换，透传 429，但冷却能保证下个请求不再选它）
+          if (r.q429?.level === "project") return { response: r.resp, via: only.raw };
+          recordProxyRateLimit(only.raw, Date.now(), r.q429?.retryAfterSecs);
         }
         else if (kind === "retryable") {
           recordProxyFailure(only.raw, "HTTP " + r.resp.status);
@@ -386,6 +402,12 @@ export async function raceUpstream(
       }
 
       // ratelimit / retryable：极速接力
+      if (res.kind === "ratelimit") {
+        // v2.5.0 修复：竞速模式此前不记 429 冷却（runAttempt 只记 success/failure），
+        // 窗口限流过的节点下个请求仍可能被选中反复撞墙。此处补记：驱逐粘性 +
+        // 冷却（用上游 retry 提示时长，~20s 级，窗口恢复后节点自动回池）。
+        recordProxyRateLimit(p.raw, Date.now(), res.retryAfterSecs);
+      }
       if (res.resp) {
         dropResp(lastResp);
         lastResp = res.resp;

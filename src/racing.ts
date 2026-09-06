@@ -274,25 +274,59 @@ export function averageLatency(healthMap: Map<string, ProxyHealth>, now: number)
   return count === 0 ? 500 : sum / count;
 }
 
-// ---------- v2.4.1：Key 级配额 429 识别（纯函数，Node 可单测） ----------
+// ---------- v2.5.0：429 分类（纯函数，Node 可单测） ----------
 
 /**
- * 判断 429 响应体是否为「Key/项目级配额耗尽」而非节点级限流。
+ * v2.5.0：429 分类（修正 v2.4.1 的语义误判）。
  *
- * 背景：本项目是单 Key 直连架构（上游只有一把 Gemini Key）。上游 429 有两类：
- *   - Key 级：配额按 PerProject / PerModel 计（如免费层
- *     GenerateRequestsPerDayPerProjectPerModel-FreeTier = 20 次/天/模型）——
- *     换任何代理节点都无法绕过，继续竞速/接力只会用同一把 Key 继续烧计数；
- *   - 节点级：出口 IP 短时限流（"Rate limit" / per-IP）—— 换节点确实有效。
- * 命中 Key 级特征时应立即把 429 透传给客户端并停止全部在飞候选。
+ * 实测教训：v2.4.1 用 /exceeded your current quota|PerProject|FreeTier/ 把一切配额类
+ * 429 判成「Key 级每日配额」硬失败 —— 但 "You exceeded your current quota" 文案同时
+ * 出现在**单 IP 滑动窗口限流**（metric generate_content_free_tier_requests，
+ * "Please retry in 20.46s"，等 ~20s 即恢复）与每日配额两类错误里；且 RPM 型
+ * quotaId（GenerateRequestsPerMinute**PerProject**PerModel）本身就含 "PerProject"。
+ * 结果：配额无限的 Key + 每 IP 20 次/窗口的限流被误判为 Key 级，不换节点直接
+ * 把 429 透传客户端 —— 而 375 个代理节点每个 IP 都有独立窗口，本可轮转绕过。
  *
- * 匹配特征（保守取交集，避免误杀节点级限流）：
- *   - "exceeded your current quota"（Google 配额耗尽标准文案）
- *   - "PerProject"（配额维度名，如 GenerateRequestsPerDayPerProjectPerModel）
- *   - "FreeTier"（免费层配额 ID 后缀）
+ * 现行语义（可用性优先）：
+ *   - per-ip  ：单 IP 滑动窗口限流（秒级 retry 提示 / PerMinute / per-IP / 裸文案 /
+ *               代理自制 429 页）→ 冷却该节点（用上游明示时长）并换节点重试；
+ *   - project ：项目级**每日**配额（PerDay 等特征，换节点无法绕过）→ 请求级
+ *               硬错误：立即透传客户端并中止在飞候选（保留 v2.4.1 保护）。
+ *   裸 "exceeded your current quota"（无 PerDay、无秒级提示）按 per-ip 处理：
+ *   最坏情况多试几个节点后仍把 429 透传（浪费 ≤max_attempts 次上游请求），
+ *   好过把可轮转绕过的限流误判成硬失败。
  */
-export function isKeyLevelQuota429(bodyText: string): boolean {
-  return /exceeded your current quota|PerProject|FreeTier/i.test(bodyText);
+export type Quota429Level = "per-ip" | "project";
+
+export interface Quota429Class {
+  level: Quota429Level;
+  /** 上游明示的滑动窗口重试等待（秒），用于该节点冷却时长 */
+  retryAfterSecs?: number;
+}
+
+/** 解析上游 429 体里的秒级重试提示：
+ *  "Please retry in 20.464172338s" / "try again in 30 seconds" / "retryDelay":"25s"。
+ *  只认 ≤300s 的值 —— 每日配额的 reset 提示是小时级，不应被当成窗口限流。 */
+export function parse429RetryAfterSecs(bodyText: string): number | null {
+  let m = bodyText.match(/retry[^0-9\n]{0,16}(\d+(?:\.\d+)?)\s*s\b/i); // Please retry in 20.46s
+  if (!m) m = bodyText.match(/try\s+again[^0-9\n]{0,16}(\d+(?:\.\d+)?)\s*(?:s\b|sec|seconds)/i);
+  if (!m) m = bodyText.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s/i);
+  if (!m) return null;
+  const v = Number(m[1]);
+  return Number.isFinite(v) && v > 0 && v <= 300 ? v : null;
+}
+
+export function classify429Body(bodyText: string): Quota429Class {
+  // 项目级每日配额特征：换节点无法绕过（quotaId PerDay / daily limit / resets daily）
+  if (/PerDay|per[_\s-]?day(?:[_\s]?limit)?\b|daily[_\s-]?limit|resets?\s+daily/i.test(bodyText)) {
+    return { level: "project" };
+  }
+  const retryAfterSecs = parse429RetryAfterSecs(bodyText);
+  if (retryAfterSecs != null) return { level: "per-ip", retryAfterSecs };
+  // 每分钟 / 单 IP 指标名 → 窗口限流
+  if (/PerMinute|per[_\s-]?minute|per[_\s-]?ip/i.test(bodyText)) return { level: "per-ip" };
+  // 其余一律按节点级（可用性优先，见函数头注释）
+  return { level: "per-ip" };
 }
 
 /** v1.9.0：巡检选点 —— 「最久未测优先」轮转。
@@ -463,14 +497,18 @@ export function recordProxyFailure(uri: string, error: string, now: number = Dat
   touchPending();
 }
 
-/** 记录 429 限流：固定 30 秒冷却 + 计次递增降权 + 驱逐粘性 */
-export function recordProxyRateLimit(uri: string, now: number = Date.now()): void {
+/** 记录 429 限流：驱逐粘性 + 计次降权 + 节点冷却。
+ *  v2.5.0：冷却时长优先用上游明示的窗口重试秒数（+2s 缓冲，clamp 5~120s）——
+ *  单 IP 滑动窗口限流 ~20s 即恢复，固定 30s 冷却会白白浪费节点；
+ *  无提示时维持 30s 默认。 */
+export function recordProxyRateLimit(uri: string, now: number = Date.now(), retryAfterSecs?: number): void {
   if (!uri) return;
   const h = healthOf(uri);
   h.rate_limit_count += 1;
-  h.last_error = "429 Rate Limit";
+  h.last_error = retryAfterSecs != null ? "429 Rate Limit (retry in " + Math.ceil(retryAfterSecs) + "s)" : "429 Rate Limit";
   h.last_fail_at = Math.floor(now / 1000);
-  h.cooldown_until = Math.floor(now / 1000) + RATE_LIMIT_COOLDOWN_SEC;
+  const cooldown = retryAfterSecs != null ? Math.min(Math.max(Math.ceil(retryAfterSecs) + 2, 5), 120) : RATE_LIMIT_COOLDOWN_SEC;
+  h.cooldown_until = Math.floor(now / 1000) + cooldown;
   h.sticky = false;
   touchPending();
 }
