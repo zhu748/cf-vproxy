@@ -50,18 +50,14 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // v2.2：暖连接优先 —— 池内有可用空闲连接的代理排到候选最前（保持其余相对次序不变）。
 // 暖连接请求跳过 TCP/代理/TLS 全部握手，几乎必然最先胜出；无暖连接时原样返回零开销。
+// v2.3：单遍扫描（旧版对每个候选调 isWarm 两次：先探测后过滤，浪费一倍扫描）。
 function warmFirst<T extends { raw: string }>(cands: T[]): T[] {
-  let anyWarm = false;
+  const warm: T[] = [];
+  const cold: T[] = [];
   for (const c of cands) {
-    if (connPool.isWarm(c.raw)) {
-      anyWarm = true;
-      break;
-    }
+    (connPool.isWarm(c.raw) ? warm : cold).push(c);
   }
-  if (!anyWarm) return cands;
-  const warm = cands.filter((c) => connPool.isWarm(c.raw));
-  const cold = cands.filter((c) => !connPool.isWarm(c.raw));
-  return [...warm, ...cold];
+  return warm.length > 0 ? [...warm, ...cold] : cands;
 }
 
 export interface UpstreamResult {
@@ -183,7 +179,7 @@ export async function rotateUpstream(
 
 // ---------- 对冲竞速模式 ----------
 
-type AttemptKind = "ok" | "ratelimit" | "retryable" | "hard";
+type AttemptKind = "ok" | "ratelimit" | "retryable" | "hard" | "aborted";
 
 interface AttemptResult {
   kind: AttemptKind;
@@ -212,6 +208,10 @@ async function runAttempt(p: { raw: string }, url: string, init: RequestInit, si
   } catch (err) {
     const ms = Date.now() - started;
     const msg = err instanceof Error ? err.message : String(err);
+    // v2.3 修复：竞速败者被主动中止（signal.aborted）不是节点故障 —— 不计失败、不进冷却。
+    // 旧版把「慢一点的第二名」也记一次失败：连败指数冷却（30s×2^n）会持续侵蚀
+    // 健康节点，竞速越活跃全池健康度衰减越快 —— 竞速的代价转嫁给了它自己受益的健康分。
+    if (signal.aborted) return { kind: "aborted", ms, error: msg };
     recordProxyFailure(p.raw, msg);
     return { kind: "retryable", ms, error: msg };
   }
@@ -324,6 +324,11 @@ export async function raceUpstream(
     const onResult = (p: { raw: string }, res: AttemptResult) => {
       active--;
       controllers.delete(p.raw);
+      // v2.3：被主动中止的败者 —— 既已定胜负，不计错误也不接力
+      if (res.kind === "aborted") {
+        dropResp(res.resp);
+        if (settled) return;
+      }
       if (settled) {
         // 败者迟到：主动释放其响应体与底层 socket
         dropResp(res.resp);

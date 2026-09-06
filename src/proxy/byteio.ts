@@ -7,10 +7,13 @@
 // 纯运行时逻辑、无平台依赖，可在 Node 下直接单测。
 // v2.0：构造参数放宽为结构性接口 —— 允许注入 tls13 客户端等自定义字节源
 // （ReadableStreamDefaultReader 天然满足该接口）。
+// v2.3：共享 TextDecoder（非流式 decode 无状态，可安全复用；旧版每行 new 一次）。
 export interface ByteSource {
   read(): Promise<{ value?: Uint8Array; done: boolean }>;
   releaseLock?(): void;
 }
+
+const TD = new TextDecoder();
 
 export class ByteBufReader {
   private buf: Uint8Array = new Uint8Array(0);
@@ -66,13 +69,13 @@ export class ByteBufReader {
     for (;;) {
       const cr = this.find(this.buf, [13, 10]);
       if (cr >= 0) {
-        const line = new TextDecoder().decode(this.take(cr));
+        const line = TD.decode(this.take(cr));
         this.take(2);
         return line;
       }
       const lf = this.buf.indexOf(10);
       if (lf >= 0) {
-        let line = new TextDecoder().decode(this.take(lf));
+        let line = TD.decode(this.take(lf));
         this.take(1);
         if (line.endsWith("\r")) line = line.slice(0, -1);
         return line;

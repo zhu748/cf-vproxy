@@ -1,8 +1,12 @@
-// 基于 socket 的 HTTP/1.1 客户端：在 Cloudflare Workers 的 TCP 隧道（SOCKS5/HTTP CONNECT + startTls）
+// 基于 socket 的 HTTP/1.1 客户端：在 Cloudflare Workers 的 TCP 隧道（SOCKS5/HTTP CONNECT + 纯 JS TLS 1.3）
 // 之上发送请求，并解析响应。支持 chunked / content-length / EOF 三种响应体形态，
 // 流式响应以 ReadableStream 透出，供 SSE 转换层消费。
 // 解析函数均为纯函数，可在 Node 下单测。
 import { ByteBufReader, concatBytes } from "./byteio.ts";
+
+// v2.3：共享编解码器（无状态、非流式模式可安全复用；旧版每请求/每响应头各 new 一次）
+const TE = new TextEncoder();
+const HEAD_TD = new TextDecoder();
 
 export interface TunnelRequest {
   method: string;
@@ -42,15 +46,23 @@ export async function writeTunnelRequest(
   }
   lines.push("Content-Length: " + req.body.length);
   lines.push("Connection: keep-alive");
-  const head = new TextEncoder().encode(lines.join("\r\n") + "\r\n\r\n");
-  // v2.1：头+体合并为单次 write —— tls13 层对单次写入做并行加密分批，
+  const head = TE.encode(lines.join("\r\n") + "\r\n\r\n");
+  // v2.1：头+体合并为单次 write —— tls13 层对单次写入做单缓冲区加密，
   // 少一次底层写调用，TCP 打包也更好（头体常落在同一批次）
-  await writer.write(req.body.length > 0 ? concatBytes([head, req.body]) : head);
+  // v2.3：预分配单缓冲区替代 concatBytes —— 少一次分配与拷贝
+  if (req.body.length === 0) {
+    await writer.write(head);
+    return;
+  }
+  const out = new Uint8Array(head.length + req.body.length);
+  out.set(head, 0);
+  out.set(req.body, head.length);
+  await writer.write(out);
 }
 
 /** 解析响应头块（含 \r\n\r\n 的完整字节块）→ 状态/原因/头部 */
 export function parseResponseHeadBlock(block: Uint8Array): ResponseHead {
-  const text = new TextDecoder().decode(block);
+  const text = HEAD_TD.decode(block);
   const sep = text.indexOf("\r\n\r\n");
   const headText = sep >= 0 ? text.slice(0, sep) : text;
   const lines = headText.split(/\r?\n/);

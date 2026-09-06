@@ -78,6 +78,104 @@ function u24(n: number): Uint8Array {
   return new Uint8Array([(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]);
 }
 
+function u32be(n: number): Uint8Array {
+  return new Uint8Array([(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
+}
+
+// ---------------------------------------------------------------------------
+// v2.3 会话票据缓存（TLS 1.3 PSK 恢复）：isolate 内存级，按 serverName 存最新票据。
+//
+// 为什么值得：v2.2 的连接复用池只覆盖「同 isolate 内存活过的连接」；连接池淘汰
+// （45s 空闲/10min 寿命/200 次）与对冲竞速的新冷连接仍要走完整握手：
+// 1-2 RTT + 4-6KB 证书飞行段 + 2-3 次非对称验签。PSK 恢复（psk_dhe_ke）下
+// 服务端只回 EncryptedExtensions + Finished：省 1 个 RTT、整个证书段传输与验签 CPU
+// —— 在慢速免费代理上单次省数百毫秒。
+//
+// 语义（RFC 8446 §4.2.11 / §4.6.1）：
+//   - PSK = HKDF-Expand-Label(resMaster, "resumption", ticket_nonce, 32)；
+//   - 服务端拒绝恢复（票据过期/单次使用已耗尽/策略）时自动回退完整握手，行为不变；
+//   - 恢复握手中无证书飞行段 —— 证书/锚定已在签发票据的首次握手中验证过，
+//     服务端真实性由 server Finished（PSK 派生密钥的 HMAC）保证；
+//   - 票据仅存 isolate 内存（不上 KV：票据属密钥材料，isolate 回收即丢弃，最坏回退完整握手）；
+//   - 同一票据被并发竞速候选同时提供时，单次使用票据会让其中一个回退完整握手 ——
+//     安全无副作用，胜者不受影响。
+// ---------------------------------------------------------------------------
+export interface SessionTicket {
+  /** 恢复 PSK = HKDF-Expand-Label(resMaster, "resumption", nonce, 32) */
+  psk: Uint8Array;
+  /** NewSessionTicket 的 ticket 字节（pre_shared_key 的 identity） */
+  identity: Uint8Array;
+  /** ticket_age_add（uint32） */
+  ageAdd: number;
+  /** ticket_lifetime（秒） */
+  lifetimeSec: number;
+  /** 收到票据的时刻（epoch ms） */
+  receivedAt: number;
+}
+
+const SESSION_CACHE_MAX = 8;
+const sessionTickets = new Map<string, SessionTicket>();
+
+/** 票据年龄（ms） */
+export function ticketAgeMs(t: Pick<SessionTicket, "receivedAt">, now: number): number {
+  return Math.max(0, now - t.receivedAt);
+}
+
+/** 票据是否仍可用（超过 min(lifetime, 7 天) 不得再使用，RFC §4.2.11.1） */
+export function ticketFresh(t: SessionTicket, now: number): boolean {
+  return ticketAgeMs(t, now) <= Math.min(t.lifetimeSec, 604_800) * 1000;
+}
+
+/** 取当前可用票据（过期自动清除） */
+export function peekSessionTicket(serverName: string, now: number = Date.now()): SessionTicket | null {
+  const t = sessionTickets.get(serverName);
+  if (!t) return null;
+  if (!ticketFresh(t, now)) {
+    sessionTickets.delete(serverName);
+    return null;
+  }
+  return t;
+}
+
+/** 存入票据（每 serverName 只留最新一张；容量上限 LRU 截断） */
+export function storeSessionTicket(serverName: string, t: SessionTicket): void {
+  if (sessionTickets.size >= SESSION_CACHE_MAX && !sessionTickets.has(serverName)) {
+    const oldest = sessionTickets.keys().next().value;
+    if (oldest !== undefined) sessionTickets.delete(oldest);
+  }
+  sessionTickets.set(serverName, t);
+}
+
+/** 票据疑似失效（带 PSK 的握手遭遇 alert/解密失败）时移除，后续冷连接回退完整握手 */
+export function invalidateSessionTicket(serverName: string): void {
+  sessionTickets.delete(serverName);
+}
+
+/** obfuscated_ticket_age = (age_ms + age_add) mod 2^32（RFC §4.2.11.1） */
+export function obfuscatedTicketAge(t: Pick<SessionTicket, "ageAdd" | "receivedAt">, now: number): number {
+  return (ticketAgeMs(t, now) + t.ageAdd) % 0x1_0000_0000;
+}
+
+/** 解析 NewSessionTicket body（extensions 尾部忽略；畸形返回 null） */
+export function parseNewSessionTicket(
+  body: Uint8Array,
+): { lifetime: number; ageAdd: number; nonce: Uint8Array; ticket: Uint8Array } | null {
+  if (body.length < 10) return null;
+  const lifetime = body[0] * 2 ** 24 + (body[1] << 16) + (body[2] << 8) + body[3];
+  const ageAdd = body[4] * 2 ** 24 + (body[5] << 16) + (body[6] << 8) + body[7];
+  let p = 8;
+  const nonceLen = body[p++];
+  if (p + nonceLen > body.length) return null;
+  const nonce = body.slice(p, p + nonceLen);
+  p += nonceLen;
+  if (p + 2 > body.length) return null;
+  const ticketLen = (body[p] << 8) | body[p + 1];
+  p += 2;
+  if (p + ticketLen > body.length) return null;
+  const ticket = body.slice(p, p + ticketLen);
+  return { lifetime, ageAdd, nonce, ticket };
+}
+
 function eqBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
@@ -149,6 +247,56 @@ export async function hkdfExpandLabel(
   if (full.length > 255) throw new Error("tls13: label too long");
   const info = concatBytes([u16(length), new Uint8Array([full.length]), full, new Uint8Array([context.length]), context]);
   return hkdfExpand(secret, info, length);
+}
+
+// ---------------------------------------------------------------------------
+// v2.3 PSK 扩展构造与 binder 计算（模块级纯函数，可单测）
+// ---------------------------------------------------------------------------
+
+export interface PskClientHelloPart {
+  /** psk_key_exchange_modes(45) 扩展数据 */
+  pskModesExt: Uint8Array;
+  /** pre_shared_key(41) 扩展数据（binder 为 32 字节零占位，稍后回填） */
+  pskExt: Uint8Array;
+  /** binder 字节长度（HMAC-SHA256 = 32） */
+  binderLen: number;
+  /** pskExt 内 identities 向量字节长度（binder 回填/截断定位用） */
+  identitiesLen: number;
+}
+
+/** 构造 psk_key_exchange_modes + pre_shared_key 扩展数据（binder 置零占位）。
+ * pre_shared_key 必须是 ClientHello 的最后一个扩展（RFC §4.2.11：服务端强制校验）。
+ * ⚠️ binder 条目长度是 u8 前缀（PskBinderEntry = opaque binder<32..255>，上限 255 字节），
+ * 与 identities 向量的 u16 前缀不同（RFC §4.2.11 结构，OpenSSL 用
+ * PACKET_get_length_prefixed_1 解析该字段，错用 u16 会报 bad extension）。 */
+export function buildPskExtensions(t: SessionTicket, now: number): PskClientHelloPart {
+  const binderLen = 32;
+  const age = obfuscatedTicketAge(t, now);
+  // PskIdentity 条目：u16 len + identity + u32 obfuscated_ticket_age
+  const idEntry = concatBytes([u16(t.identity.length), t.identity, u32be(age)]);
+  const identities = concatBytes([u16(idEntry.length), idEntry]);
+  // binders：u16 列表长 + （u8 条目长 + binder 字节）× N（零占位）
+  const binders = concatBytes([u16(1 + binderLen), new Uint8Array([binderLen]), new Uint8Array(binderLen)]);
+  return {
+    // PskKeyExchangeMode ke_modes<1..255>：1 个模式，psk_dhe_ke(1) —— 前向保密的 PSK+DHE
+    pskModesExt: new Uint8Array([0x01, 0x01]),
+    pskExt: concatBytes([identities, binders]),
+    binderLen,
+    identitiesLen: identities.length,
+  };
+}
+
+/** 计算 pre_shared_key 的 binder（RFC §4.2.11.2，与 Finished 同构）：
+ *   binder_key = Derive-Secret(HKDF-Extract(0, PSK), "res binder", "")
+ *   binder = HMAC(Expand-Label(binder_key, "finished", ""), TranscriptHash(Truncate(CH)))
+ * Truncate(CH) = CH 截止到 identities 向量末尾（不含整个 binders 向量）。 */
+export async function computePskBinder(psk: Uint8Array, truncatedCh: Uint8Array): Promise<Uint8Array> {
+  const zeros32 = new Uint8Array(32);
+  const early = await hkdfExtract(zeros32, psk);
+  const [emptyHash, th] = await Promise.all([sha256(new Uint8Array(0)), sha256(truncatedCh)]);
+  const binderKey = await hkdfExpandLabel(early, "res binder", emptyHash, 32);
+  const finishedKey = await hkdfExpandLabel(binderKey, "finished", new Uint8Array(0), 32);
+  return hmacSha256(finishedKey, th);
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +685,12 @@ export class Tls13Client {
   private peerClosed = false;
   /** post-handshake 消息缓冲（NST/KU 跨记录重组） */
   private postBuf: Uint8Array = new Uint8Array(0);
+  /** v2.3：本次握手中出的恢复票据（null = 未提供） */
+  private offeredPsk: SessionTicket | null = null;
+  /** v2.3：服务端是否接受了恢复（无证书飞行段） */
+  private pskAccepted = false;
+  /** v2.3：resumption master secret（本连接 NST 派生新票据用） */
+  private resMaster: Uint8Array | null = null;
 
   constructor(reader: ByteBufReader, writer: { write(chunk: Uint8Array): Promise<void> }, opts: Tls13Options) {
     this.reader = reader;
@@ -547,6 +701,16 @@ export class Tls13Client {
   /** v2.2：连接是否已关闭（连接池存活判定用） */
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  /** v2.3：本次握手是否通过 PSK 恢复完成（观测/测试用） */
+  get resumed(): boolean {
+    return this.pskAccepted;
+  }
+
+  /** v2.3：本次握手是否提供了恢复票据（票据失效时调用方据此清理缓存） */
+  get pskOffered(): boolean {
+    return this.offeredPsk !== null;
   }
 
   close(): void {
@@ -620,47 +784,57 @@ export class Tls13Client {
       this.fail("record AEAD decryption failed (bad_record_mac)");
     }
     this.sKeys.seq++;
-    // 去尾部零填充，末字节为真实内容类型
+    // 去尾部零填充，末字节为真实内容类型（v2.3：plain 是 decrypt 产出的独立缓冲，
+    // subarray 零拷贝视图即安全，省每记录一次 16KB 复制）
     let end = plain.length - 1;
     while (end > 0 && plain[end] === 0) end--;
     const innerType = plain[end];
-    const payload = plain.slice(0, end);
+    const payload = plain.subarray(0, end);
     return { type, payload, inner: innerType };
   }
 
-  /** 发送一条加密记录（握手 innerType=22 / 应用数据 innerType=23） */
+  /** 发送一条加密记录（握手 innerType=22 / 应用数据 innerType=23）。
+   * v2.3：单缓冲区写路径 —— 头/密文共处一个预分配 buffer：每记录省 2 次中间分配
+   * （旧路径 inner 拼接 + head+ct 拼接）与对应拷贝，TCP 写入仍保持单次。 */
   private async writeRecord(innerType: number, payload: Uint8Array): Promise<void> {
-    if (!this.cKeys.key) this.fail("write before client keys installed");
-    const inner = concatBytes([payload, new Uint8Array([innerType])]);
-    const len = inner.length + 16;
-    const head = new Uint8Array([0x17, 0x03, 0x03, (len >> 8) & 0xff, len & 0xff]);
-    const ct = new Uint8Array(await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: this.cKeys.nonce() as unknown as ArrayBuffer, additionalData: head as unknown as ArrayBuffer, tagLength: 128 },
-      this.cKeys.key, inner as unknown as ArrayBuffer,
-    ));
-    this.cKeys.seq++;
-    await this.writer.write(concatBytes([head, ct]));
+    await this.writeRecords(innerType, [payload]);
   }
 
-  /** v2.1：批量发送加密记录 —— 多条记录并行加密（预计算 nonce）后合并为单次底层写。
-   * 大请求体（如 1MB = 64 条记录）从「64 轮串行 encrypt→await write」变为
-   * 「64 个并行 encrypt + 1 次写」：省去 63 次 await 往返与逐条写带来的 TCP 小包。
+  /** v2.3：批量发送加密记录 —— 逐条加密写入同一个预分配输出缓冲区，最后一次底层写。
+   * 大请求体（如 1MB = 64 条记录）从「64 轮串行 encrypt→await write + 全部密文
+   * 常驻 + 末尾整体拼接拷贝」变为「64 次逐条 encrypt（临时密文即用即弃）+ 1 次写」：
+   * 峰值内存从 ~2× 降到 ~1×，拷贝次数从每记录 3 次降到 2 次，TCP 打包不变。
    * 分批上限 256 条（约 4MB 密文）以约束峰值内存。 */
-  private async writeRecordsBatch(innerType: number, payloads: Uint8Array[]): Promise<void> {
+  private async writeRecords(innerType: number, payloads: Uint8Array[]): Promise<void> {
     if (!this.cKeys.key) this.fail("write before client keys installed");
-    // map 回调同步执行：先按当前 seq 逐条预取 nonce（每条递增），再并行加密
-    const parts = await Promise.all(payloads.map((payload) => {
+    const key = this.cKeys.key;
+    let total = 0;
+    for (const p of payloads) total += REC_HDR + p.length + 1 + 16;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const payload of payloads) {
+      const innerLen = payload.length + 1;
+      const len = innerLen + 16;
+      const head = out.subarray(off, off + REC_HDR);
+      head[0] = 0x17;
+      head[1] = 0x03;
+      head[2] = 0x03;
+      head[3] = (len >> 8) & 0xff;
+      head[4] = len & 0xff;
+      const inner = out.subarray(off + REC_HDR, off + REC_HDR + innerLen);
+      inner.set(payload, 0);
+      inner[innerLen - 1] = innerType;
+      // nonce 按 seq 顺序预取（每条递增）；encrypt 串行进行，视图安全
       const nonce = this.cKeys.nonce();
       this.cKeys.seq++;
-      const inner = concatBytes([payload, new Uint8Array([innerType])]);
-      const len = inner.length + 16;
-      const head = new Uint8Array([0x17, 0x03, 0x03, (len >> 8) & 0xff, len & 0xff]);
-      return crypto.subtle.encrypt(
+      const ct = new Uint8Array(await crypto.subtle.encrypt(
         { name: "AES-GCM", iv: nonce as unknown as ArrayBuffer, additionalData: head as unknown as ArrayBuffer, tagLength: 128 },
-        this.cKeys.key!, inner as unknown as ArrayBuffer,
-      ).then((ct) => concatBytes([head, new Uint8Array(ct)]));
-    }));
-    await this.writer.write(concatBytes(parts));
+        key, inner as unknown as ArrayBuffer,
+      ));
+      out.set(ct, off + REC_HDR);
+      off += REC_HDR + len;
+    }
+    await this.writer.write(out);
   }
 
   // ---- 握手消息重组 ----
@@ -688,14 +862,25 @@ export class Tls13Client {
 
   async handshake(): Promise<void> {
     if (this.closed) throw new Error("tls13: already closed");
+    // v2.3：优先尝试 PSK 会话恢复（同 isolate 先前握手留下的票据）；
+    // 服务端拒绝时自动回退完整握手路径，行为与无票据时完全一致
+    this.offeredPsk = peekSessionTicket(this.opts.serverName);
     // 1. ClientHello
     const x25519 = (await crypto.subtle.generateKey(
       { name: "X25519" } as unknown as { name: string }, false, ["deriveBits"],
     )) as unknown as { publicKey: CryptoKey; privateKey: CryptoKey };
     const clientPub = new Uint8Array((await crypto.subtle.exportKey("raw", x25519.publicKey)) as unknown as ArrayBuffer);
     const sessionId = crypto.getRandomValues(new Uint8Array(32));
-    const chBody = this.buildClientHello(clientPub, sessionId);
-    const chRaw = concatBytes([new Uint8Array([1]), u24(chBody.length), chBody]);
+    const built = this.buildClientHello(clientPub, sessionId, this.offeredPsk);
+    const chRaw = concatBytes([new Uint8Array([1]), u24(built.body.length), built.body]);
+    if (this.offeredPsk && built.binderAtInBody >= 0) {
+      // binder 回填：transcript 覆盖 Truncate(CH) = CH 截止到 identities 末尾
+      //（不含整个 binders 向量，含其 u16 长度前缀——与 OpenSSL binderoffset 语义一致）
+      const binderAt = 4 + built.binderAtInBody;
+      const truncateAt = 4 + built.binderTruncateAtInBody;
+      const binder = await computePskBinder(this.offeredPsk.psk, chRaw.subarray(0, truncateAt));
+      chRaw.set(binder, binderAt);
+    }
     this.transcript.push(chRaw);
     const chHead = new Uint8Array([0x16, 0x03, 0x01, (chRaw.length >> 8) & 0xff, chRaw.length & 0xff]);
     await this.writer.write(concatBytes([chHead, chRaw]));
@@ -719,6 +904,12 @@ export class Tls13Client {
     if (shMsg.cipher !== 0x1301) this.fail("server picked unsupported cipher 0x" + shMsg.cipher.toString(16));
     if (!shMsg.serverKeyShare || shMsg.serverKeyShare.group !== 0x001d) this.fail("no x25519 key_share from server");
     if (!shMsg.tls13) this.fail("server did not negotiate TLS 1.3");
+    // v2.3：PSK 协商结果 —— 服务端选中 identity 0 = 接受恢复；无 pre_shared_key 扩展 =
+    // 拒绝（票据过期/单次使用已耗尽/服务端策略），回退完整握手（安全降级，非错误）
+    if (this.offeredPsk) {
+      if (shMsg.selectedIdentity === 0) this.pskAccepted = true;
+      else if (shMsg.selectedIdentity !== null) this.fail("server selected unexpected psk identity " + shMsg.selectedIdentity);
+    }
 
     // 3. 密钥推导（HKDF-SHA256，RFC 8446 §7.1）
     const serverPubKey = await crypto.subtle.importKey(
@@ -730,10 +921,12 @@ export class Tls13Client {
     const zeros32 = new Uint8Array(32);
     // v2.1 优化：早期密钥调度与 transcript 哈希相互独立，并行执行
     // （th1 只依赖 CH..SH；early/derived/hs 链只依赖 shared secret）
+    // v2.3：PSK 被接受时 Early Secret 的输入为 PSK（RFC §7.1 密钥调度图），
+    // 下游 derived→hs→master→application 链路结构不变
     const [emptyHash, th1, earlySecret] = await Promise.all([
       sha256(new Uint8Array(0)),
       this.transcriptHash(),
-      hkdfExtract(zeros32, zeros32),
+      hkdfExtract(zeros32, this.pskAccepted ? this.offeredPsk!.psk : zeros32),
     ]);
     const derived1 = await hkdfExpandLabel(earlySecret, "derived", emptyHash, 32);
     const hsSecret = await hkdfExtract(derived1, shared);
@@ -746,7 +939,8 @@ export class Tls13Client {
     this.serverKeysInstalled = true;
     this.clientKeysInstalled = true;
 
-    // 4. 服务端加密飞行段：EncryptedExtensions / Certificate / CertificateVerify / Finished
+    // 4. 服务端加密飞行段：PSK 恢复时为 EncryptedExtensions / Finished（无证书段），
+    //    完整握手时为 EncryptedExtensions / Certificate / CertificateVerify / Finished
     let ee: Uint8Array | null = null;
     let certMsg: { type: number; body: Uint8Array; raw: Uint8Array } | null = null;
     let cvMsg: { type: number; body: Uint8Array; raw: Uint8Array } | null = null;
@@ -754,6 +948,7 @@ export class Tls13Client {
     // transcript 前缀长度：CV 验签用 CH..Cert；server Finished 验签用 CH..CV；应用密钥用 CH..SF
     let transcriptLenBeforeCv = 0;
     let transcriptLenBeforeSf = 0;
+    const flightDone = () => (this.pskAccepted ? !!ee && !!sfMsg : !!ee && !!certMsg && !!cvMsg && !!sfMsg);
     for (;;) {
       const rec = await this.readRecord();
       if (rec.type === 0x14) continue;
@@ -773,9 +968,11 @@ export class Tls13Client {
           ee = m.raw;
           this.transcript.push(m.raw);
         } else if (m.type === 11 && !certMsg) {
+          if (this.pskAccepted) this.fail("unexpected Certificate message in PSK-resumed handshake");
           certMsg = m;
           this.transcript.push(m.raw);
         } else if (m.type === 15 && !cvMsg) {
+          if (this.pskAccepted) this.fail("unexpected CertificateVerify message in PSK-resumed handshake");
           transcriptLenBeforeCv = this.transcript.length;
           cvMsg = m;
           this.transcript.push(m.raw);
@@ -786,42 +983,60 @@ export class Tls13Client {
         } else {
           this.fail("unexpected handshake message type " + m.type);
         }
-        if (ee && certMsg && cvMsg && sfMsg) break;
+        if (flightDone()) break;
       }
-      if (ee && certMsg && cvMsg && sfMsg) break;
+      if (flightDone()) break;
     }
-    if (!ee || !certMsg || !cvMsg || !sfMsg) this.fail("incomplete server flight");
+    // 显式收窄：fail() 返回 never，后续代码中各消息为非空
+    if (this.pskAccepted) {
+      if (!ee || !sfMsg) this.fail("incomplete server flight");
+    } else if (!ee || !certMsg || !cvMsg || !sfMsg) {
+      this.fail("incomplete server flight");
+    }
 
     // 5. 证书链校验 + CertificateVerify + Finished
-    // v2.1 优化：链验签与 transcript 哈希/CV 内容构造完全独立，整体并行执行
-    const cvAlg = (cvMsg.body[0] << 8) | cvMsg.body[1];
-    const cvSigLen = (cvMsg.body[2] << 8) | cvMsg.body[3];
-    const cvSig = cvMsg.body.slice(4, 4 + cvSigLen);
-    const certs = parseTlsCertificate(certMsg.body);
-    if (certs.length < 1) this.fail("empty certificate chain");
-    const leaf = parseCertificate(certs[0]);
-    const emptyU8 = new Uint8Array(0);
-    // v2.1 优化：链验签与 transcript 哈希/finished 密钥推导完全独立，并行执行
-    const [, thCV, thSF, sFinKey] = await Promise.all([
-      this.validateChain(certs, leaf),
-      sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeCv))), // CH..Certificate
-      sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeSf))), // CH..CV
-      hkdfExpandLabel(sHs, "finished", emptyU8, 32),
-    ]);
-    const cvContent = concatBytes([
-      new Uint8Array(64).fill(0x20),
-      te.encode("TLS 1.3, server CertificateVerify"),
-      new Uint8Array([0]),
-      thCV,
-    ]);
-    // v2.1 优化：CV 验签与 SF HMAC 并行
-    const [cvOk, sfVerify] = await Promise.all([
-      this.verifyTlsSignature(cvContent, cvSig, cvAlg, leaf),
-      hmacSha256(sFinKey, thSF),
-    ]);
-    if (!cvOk) this.fail("CertificateVerify signature invalid (possible MITM)");
+    //    v2.3：PSK 恢复时无证书飞行段 —— 证书/锚定已在签发票据的首次握手中验证过，
+    //    本握手的服务端真实性由 server Finished（PSK 派生密钥的 HMAC）保证，
+    //    只需验 server Finished
     const sfData = sfMsg.body.slice(0, 32);
-    if (!eqBytes(sfVerify, sfData)) this.fail("server Finished verify_data mismatch");
+    const emptyU8 = new Uint8Array(0);
+    if (this.pskAccepted) {
+      const [thSF, sFinKey] = await Promise.all([
+        sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeSf))), // CH..EE
+        hkdfExpandLabel(sHs, "finished", emptyU8, 32),
+      ]);
+      const sfVerify = await hmacSha256(sFinKey, thSF);
+      if (!eqBytes(sfVerify, sfData)) this.fail("server Finished verify_data mismatch");
+    } else {
+      // v2.1 优化：链验签与 transcript 哈希/finished 密钥推导完全独立，并行执行
+      const cv = cvMsg!;
+      const cvAlg = (cv.body[0] << 8) | cv.body[1];
+      const cvSigLen = (cv.body[2] << 8) | cv.body[3];
+      const cvSig = cv.body.slice(4, 4 + cvSigLen);
+      const certs = parseTlsCertificate(certMsg!.body);
+      if (certs.length < 1) this.fail("empty certificate chain");
+      const leaf = parseCertificate(certs[0]);
+      // v2.1 优化：链验签与 transcript 哈希/finished 密钥推导完全独立，并行执行
+      const [, thCV, thSF, sFinKey] = await Promise.all([
+        this.validateChain(certs, leaf),
+        sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeCv))), // CH..Certificate
+        sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeSf))), // CH..CV
+        hkdfExpandLabel(sHs, "finished", emptyU8, 32),
+      ]);
+      const cvContent = concatBytes([
+        new Uint8Array(64).fill(0x20),
+        te.encode("TLS 1.3, server CertificateVerify"),
+        new Uint8Array([0]),
+        thCV,
+      ]);
+      // v2.1 优化：CV 验签与 SF HMAC 并行
+      const [cvOk, sfVerify] = await Promise.all([
+        this.verifyTlsSignature(cvContent, cvSig, cvAlg, leaf),
+        hmacSha256(sFinKey, thSF),
+      ]);
+      if (!cvOk) this.fail("CertificateVerify signature invalid (possible MITM)");
+      if (!eqBytes(sfVerify, sfData)) this.fail("server Finished verify_data mismatch");
+    }
 
     // 6. 应用密钥 + 客户端 Finished
     // v2.1 优化：derived2 与 th3 并行；三个应用期推导并行
@@ -840,16 +1055,29 @@ export class Tls13Client {
     await this.writeRecord(0x16, cfRaw); // 客户端 Finished（c_hs 密钥；必须在 install 覆盖 cKeys 之前完成）
     this.transcript.push(cfRaw);
 
-    // v2.1 优化：两套应用密钥安装并行
-    await Promise.all([this.cKeys.install(cAp), this.sKeys.install(sAp)]);
+    // v2.3：resumption master = Derive-Secret(master, "res master", CH..client Finished)，
+    // 供本连接后续 NewSessionTicket 派生新票据（票据滚动更新，缓存不随连接退役而失效）
+    const th4 = await sha256(concatBytes(this.transcript)); // CH..client Finished
+    // v2.1 优化：两套应用密钥安装并行；resMaster 推导也一并并行
+    await Promise.all([
+      this.cKeys.install(cAp),
+      this.sKeys.install(sAp),
+      hkdfExpandLabel(masterSecret, "res master", th4, 32).then((v) => {
+        this.resMaster = v;
+      }),
+    ]);
     this.cSecretApp = cAp;
     this.sSecretApp = sAp;
     this.appPhase = true;
+    // v2.3：握手完成 —— transcript（含整条证书链字节，~10KB/连接）与握手缓冲不再
+    // 需要，显式释放：连接池 12 条 + 竞速在飞候选各自持有一份，积少成多
+    this.transcript = [];
+    this.hsBuf = new Uint8Array(0);
   }
 
   // ---- 应用数据 ----
 
-  /** 写应用数据（自动按 16KB 分片；v2.1：多分片并行加密 + 批量写） */
+  /** 写应用数据（自动按 16KB 分片；v2.1：批量合并为单次底层写） */
   async write(bytes: Uint8Array): Promise<void> {
     if (this.closed || this.peerClosed) throw new Error("tls13: connection closed");
     if (!this.appPhase) throw new Error("tls13: handshake not completed");
@@ -859,11 +1087,11 @@ export class Tls13Client {
     }
     const chunks: Uint8Array[] = [];
     for (let off = 0; off < bytes.length; off += MAX_RECORD) {
-      chunks.push(bytes.slice(off, off + MAX_RECORD));
+      chunks.push(bytes.subarray(off, off + MAX_RECORD));
     }
     const BATCH = 256; // ≈4MB 密文/批，约束峰值内存
     for (let i = 0; i < chunks.length; i += BATCH) {
-      await this.writeRecordsBatch(0x17, chunks.slice(i, i + BATCH));
+      await this.writeRecords(0x17, chunks.slice(i, i + BATCH));
     }
   }
 
@@ -893,7 +1121,7 @@ export class Tls13Client {
       this.fail("server alert code " + (rec.payload[1] ?? -1));
     }
     if (rec.inner === 0x16) {
-      // post-handshake 握手消息：NewSessionTicket(4) 跳过；KeyUpdate(24) 重密钥
+      // post-handshake 握手消息：NewSessionTicket(4) 吸收入会话缓存；KeyUpdate(24) 重密钥
       let buf = this.postBuf.length === 0 ? rec.payload : concatBytes([this.postBuf, rec.payload]);
       this.postBuf = new Uint8Array(0);
       for (;;) {
@@ -901,7 +1129,9 @@ export class Tls13Client {
         if (!m) break;
         buf = m.rest;
         if (m.type === 4) {
-          continue; // NewSessionTicket：跳过
+          // v2.3：NewSessionTicket —— 派生 PSK 存入会话缓存，后续冷连接即可恢复
+          await this.absorbSessionTicket(m.body);
+          continue;
         }
         if (m.type === 24) {
           await this.applyKeyUpdate(m.body);
@@ -913,6 +1143,23 @@ export class Tls13Client {
       return this.read();
     }
     this.fail("unexpected inner type " + rec.inner);
+  }
+
+  /** v2.3：解析 NewSessionTicket 并派生 PSK 存入会话缓存
+   * （PSK = HKDF-Expand-Label(resMaster, "resumption", ticket_nonce, 32)；
+   *   lifetime 为 0 或超 7 天上限的票据直接丢弃；同主机只留最新一张） */
+  private async absorbSessionTicket(body: Uint8Array): Promise<void> {
+    if (!this.resMaster) return;
+    const parsed = parseNewSessionTicket(body);
+    if (!parsed || parsed.lifetime === 0 || parsed.lifetime > 604_800) return;
+    const psk = await hkdfExpandLabel(this.resMaster, "resumption", parsed.nonce, 32);
+    storeSessionTicket(this.opts.serverName, {
+      psk,
+      identity: parsed.ticket,
+      ageAdd: parsed.ageAdd,
+      lifetimeSec: parsed.lifetime,
+      receivedAt: Date.now(),
+    });
   }
 
   private async applyKeyUpdate(body: Uint8Array): Promise<void> {
@@ -934,7 +1181,14 @@ export class Tls13Client {
 
   // ---- 构造 ClientHello ----
 
-  private buildClientHello(clientPub: Uint8Array, sessionId: Uint8Array): Uint8Array {
+  /** v2.3：返回 body 与 binder 回填定位；binderAtInBody < 0 表示无 PSK 扩展。
+   * binderTruncateAtInBody = transcript 截断点（binders 向量的 u16 长度前缀之前，
+   * 已对照 OpenSSL tls_psk_do_binder 的 binderoffset 语义验证） */
+  private buildClientHello(
+    clientPub: Uint8Array,
+    sessionId: Uint8Array,
+    ticket: SessionTicket | null,
+  ): { body: Uint8Array; binderAtInBody: number; binderTruncateAtInBody: number } {
     const host = te.encode(this.opts.serverName);
     const sniData = new Uint8Array(2 + 1 + 2 + host.length);
     const listLen = 1 + 2 + host.length;
@@ -961,13 +1215,26 @@ export class Tls13Client {
       [0x00, 0x2b, versionsData],
       [0x00, 0x33, keyShareData],
     ];
+    // v2.3：PSK 恢复 —— psk_key_exchange_modes(45) + pre_shared_key(41)；
+    // pre_shared_key 必须是最后一个扩展（RFC §4.2.11：服务端强制校验），binder 以零占位
+    let pskPart: PskClientHelloPart | null = null;
+    if (ticket) {
+      pskPart = buildPskExtensions(ticket, Date.now());
+      exts.push([0x00, 0x2d, pskPart.pskModesExt]);
+      exts.push([0x00, 0x29, pskPart.pskExt]);
+    }
     let extsLen = 0;
     for (const [, , d] of exts) extsLen += 4 + d.length;
     const extsBlock = new Uint8Array(2 + extsLen);
     extsBlock[0] = extsLen >> 8;
     extsBlock[1] = extsLen & 0xff;
     let off = 2;
+    let binderAtInExts = -1;
     for (const [t1, t2, d] of exts) {
+      if (t1 === 0x00 && t2 === 0x29 && pskPart) {
+        // binder 字节起点 = 本扩展头后 identities 向量 + u16 列表长 + u8 条目长
+        binderAtInExts = off + 4 + pskPart.identitiesLen + 2 + 1;
+      }
       extsBlock[off++] = t1;
       extsBlock[off++] = t2;
       extsBlock[off++] = d.length >> 8;
@@ -991,7 +1258,10 @@ export class Tls13Client {
     body[p++] = 0x01; // 压缩方法数
     body[p++] = 0x00; // null
     body.set(extsBlock, p);
-    return body;
+    const binderAtInBody = binderAtInExts >= 0 ? p + binderAtInExts : -1;
+    // 截断点 = binders 向量的 u16 列表长前缀之前（binder 字节前 3 字节：u16 列表长 + u8 条目长）
+    const binderTruncateAtInBody = binderAtInBody >= 0 ? binderAtInBody - 3 : -1;
+    return { body, binderAtInBody, binderTruncateAtInBody };
   }
 
   // ---- 证书链校验 ----
@@ -1112,6 +1382,8 @@ interface ServerHelloInfo {
   cipher: number;
   helloRetry: boolean;
   serverKeyShare: { group: number; key: Uint8Array } | null;
+  /** v2.3：pre_shared_key 扩展选中的 identity 序号（null = 未接受恢复） */
+  selectedIdentity: number | null;
 }
 
 function parseServerHello(body: Uint8Array): ServerHelloInfo {
@@ -1131,6 +1403,7 @@ function parseServerHello(body: Uint8Array): ServerHelloInfo {
   const extsEnd = p + extsLen;
   let tls13 = false;
   let serverKeyShare: { group: number; key: Uint8Array } | null = null;
+  let selectedIdentity: number | null = null;
   const helloRetry = eqBytes(random, new Uint8Array(HRR_RANDOM));
   while (p + 4 <= extsEnd) {
     const et = (body[p] << 8) | body[p + 1];
@@ -1148,10 +1421,13 @@ function parseServerHello(body: Uint8Array): ServerHelloInfo {
         const klen = (ed[2] << 8) | ed[3];
         serverKeyShare = { group, key: ed.slice(4, 4 + klen) };
       }
+    } else if (et === 0x0029) {
+      // v2.3：pre_shared_key = selected_identity（u16）—— 服务端接受恢复
+      if (ed.length >= 2) selectedIdentity = (ed[0] << 8) | ed[1];
     }
   }
   void legacyVersion;
-  return { tls13, cipher, helloRetry, serverKeyShare };
+  return { tls13, cipher, helloRetry, serverKeyShare, selectedIdentity };
 }
 
 /** TLS Certificate 消息 body → DER 证书数组

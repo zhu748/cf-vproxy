@@ -22,13 +22,24 @@ import {
   type ResponseHead,
 } from "./httpclient.ts";
 import { httpConnectHandshake, socks4Handshake, socks5Handshake } from "./tunnel.ts";
-import { Tls13Client } from "./tls13.ts";
+import { Tls13Client, invalidateSessionTicket } from "./tls13.ts";
 
 const SUB_CACHE_KEY = "proxy_cache";
 const MAX_PROXIES = 200;
 const CONNECT_TIMEOUT_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const TLS13_HANDSHAKE_TIMEOUT_MS = 12_000;
+// v2.4：响应头等待上限。connect/代理握手/TLS 握手/写请求都有超时，唯独「等服务端响应头」
+// 此前没有 —— 代理静默黑洞（TCP 活着但不转发了）会把请求永久挂起：竞速模式靠对冲兜底，
+// 顺序模式（单节点 / 关竞速）没有任何兜底，客户端不断开就一直挂着。
+// 120s 足够宽容：Gemini 非流式 + 深度思考的长生成通常也在 120s 内返回头部。
+const RESPONSE_HEAD_TIMEOUT_MS = 120_000;
+// v2.4：订阅拉取超时 10s → 20s：免费托管平台（Render 等）冷启动常态 30s+，
+// 10s 必失败；20s 至少能在实例温热时一次成功（cron 每 15 分钟一跳会持续保温）。
+const SUB_FETCH_TIMEOUT_MS = 20_000;
+
+// v2.4：共享编码器（补漏：encodeBody 此前每请求 new 一个 TextEncoder）
+const TE = new TextEncoder();
 
 // v1.6.0：订阅缓存与代理池的 isolate 内存缓存 ——
 // 此前每个业务请求都读一次 KV 订阅缓存 + 全量重新解析/去重代理 URL（免费计划 10 万读/天的
@@ -99,7 +110,7 @@ export async function refreshSubscription(env: Env, url: string): Promise<SubCac
   try {
     const resp = await fetch(url, {
       headers: { "User-Agent": "cf-vproxy/1.1" },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(SUB_FETCH_TIMEOUT_MS),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const lines = decodeSubscription(await resp.text());
@@ -195,6 +206,9 @@ function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Promise<T> {
   const t = new Promise<never>((_, rej) => {
     timer = setTimeout(() => rej(new Error(msg)), ms);
   });
+  // v2.4：败者善后 —— 超时先到时，p 稍后 reject（socket 已被关闭）会成为
+  // unhandled rejection（workerd 会记入异常日志）。这里给 p 挂一个 no-op 吸收器。
+  p.catch(() => {});
   return Promise.race([p, t]).finally(() => {
     if (timer) clearTimeout(timer);
   }) as Promise<T>;
@@ -286,6 +300,12 @@ async function viaProxyCold(
     try {
       await withTimeout(tls.handshake(), TLS13_HANDSHAKE_TIMEOUT_MS, "tls13 handshake timeout (" + p.host + ":" + p.port + ")");
     } catch (err) {
+      // v2.3：带 PSK 的握手遭遇 alert/解密/Finished 校验类失败 → 票据大概率失效
+      //（过期/轮换/状态失配），从会话缓存移除，后续冷连接直接回退完整握手，
+      // 避免反复撞死票浪费一次竞速候选；纯网络类错误（超时/EOF）不动票据
+      if (tls.pskOffered && err instanceof Error && /alert|bad_record_mac|Finished verify|decrypt/i.test(err.message)) {
+        invalidateSessionTicket(targetHost);
+      }
       closeQuietly(sock); // 超时时握手 promise 仍悬挂：必须显式关 socket（协议错误路径已由 tls.close→onClose 关闭）
       throw err;
     }
@@ -338,9 +358,15 @@ async function sendRequestOnConn(
       "write request timeout",
     );
     // 响应头：1xx 过渡响应跳过（未用 Expect: 100-continue，仅防御性兼容）
+    // v2.4：等响应头加上限（见 RESPONSE_HEAD_TIMEOUT_MS 注释）—— 死隧道 120s 内
+    // 必失败并进入健康度/冷却，而不是把请求与并发闸门名额永久占死。
     let head: ResponseHead;
     for (;;) {
-      const headBlock = await reader.readHeaderBlock();
+      const headBlock = await withTimeout(
+        reader.readHeaderBlock(),
+        RESPONSE_HEAD_TIMEOUT_MS,
+        "no response head within " + RESPONSE_HEAD_TIMEOUT_MS / 1000 + "s (dead tunnel?)",
+      );
       markBytes?.();
       head = parseResponseHeadBlock(headBlock);
       if (head.status < 100 || head.status >= 200) break;
@@ -376,7 +402,7 @@ async function sendRequestOnConn(
 
 async function encodeBody(body: BodyInit | null | undefined): Promise<Uint8Array> {
   if (!body) return new Uint8Array(0);
-  if (typeof body === "string") return new TextEncoder().encode(body);
+  if (typeof body === "string") return TE.encode(body);
   if (body instanceof Uint8Array) return body;
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   // ReadableStream / FormData / URLSearchParams 等场景：当前仅内部使用 string/Uint8Array

@@ -11,6 +11,9 @@ import { ssePingFrame } from "../fakestream.ts";
 
 const PING_INTERVAL_MS = 10_000;
 
+// v2.4：共享编码器（旧版每流 new 一个；ping/数据帧编码无状态可安全复用）
+const TE = new TextEncoder();
+
 export const SSE_HEADERS: Record<string, string> = {
   "content-type": "text/event-stream; charset=utf-8",
   "cache-control": "no-cache, no-transform",
@@ -18,7 +21,7 @@ export const SSE_HEADERS: Record<string, string> = {
   "x-accel-buffering": "no",
 };
 
-const sleep = (ms: number) => new Promise<"ping">((r) => setTimeout(r, ms));
+// v2.4：sleep 工具已内联为可清除的 armPing（见上），不再需要模块级 sleep。
 
 /**
  * 把 AsyncGenerator<string> 包成 SSE Response（带 10s ping 保活）。
@@ -31,20 +34,37 @@ export function sseResponseFromGenerator(
   upstream?: Response | null,
   onDone?: () => void,
 ): Response {
-  const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       const pending = gen.next();
+      // v2.4：可清除的单实例 ping 计时器。旧版每轮 Promise.race 都新建一个 10s sleep，
+      // 数据先到时旧计时器不被清除地悬挂着（长流式请求在多次 ping 循环后累积大量
+      // 待触发定时器，每个都存活到自然到期）。现在：数据到达立即 clearTimeout，
+      // ping 触发后重置一个新计时器继续等待同一次 next()。
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const armPing = () =>
+        new Promise<"ping">((res) => {
+          timer = setTimeout(() => res("ping"), PING_INTERVAL_MS);
+        });
+      const clearTimer = () => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+      };
+      let ping = armPing();
       try {
         for (;;) {
           const winner = await Promise.race([
             pending.then((v) => ({ kind: "data" as const, v })),
-            sleep(PING_INTERVAL_MS),
+            ping,
           ]);
           if (winner === "ping") {
-            controller.enqueue(encoder.encode(ssePingFrame()));
-            continue; // 继续等待同一个 next() promise
+            controller.enqueue(TE.encode(ssePingFrame()));
+            ping = armPing(); // 重置计时器，继续等待同一个 next() promise
+            continue;
           }
+          clearTimer();
           const { value, done } = winner.v;
           if (done) {
             try {
@@ -54,11 +74,12 @@ export function sseResponseFromGenerator(
             }
             controller.close();
           } else {
-            controller.enqueue(encoder.encode(value));
+            controller.enqueue(TE.encode(value));
           }
           return;
         }
       } catch (e) {
+        clearTimer();
         try {
           onDone?.();
         } catch {
@@ -70,6 +91,8 @@ export function sseResponseFromGenerator(
         } catch {
           // 流已关闭
         }
+      } finally {
+        clearTimer();
       }
     },
     cancel() {

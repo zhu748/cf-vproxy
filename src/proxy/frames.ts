@@ -6,6 +6,10 @@
 
 export const SOCKS5_VER = 0x05;
 
+// v2.4：共享编解码器（帧构造/应答解析均无状态可安全复用；旧版每帧 new）
+const TE = new TextEncoder();
+const TD = new TextDecoder();
+
 export type SocksAuthMethod = 0x00 | 0x02; // 0x00 无认证 / 0x02 用户名密码
 
 /** 构造方法协商帧：[VER, NMETHODS, METHODS...] */
@@ -24,9 +28,8 @@ export function parseSocks5MethodReply(
 
 /** 构造 RFC 1929 用户名密码子协商帧：[0x01, ULEN, U..., PLEN, P...] */
 export function buildSocks5AuthRequest(username: string, password: string): Uint8Array {
-  const enc = new TextEncoder();
-  const u = enc.encode(username);
-  const p = enc.encode(password);
+  const u = TE.encode(username);
+  const p = TE.encode(password);
   if (u.length > 255 || p.length > 255) throw new Error("socks5: username/password too long (max 255 bytes)");
   const out = new Uint8Array(3 + u.length + p.length);
   let off = 0;
@@ -50,8 +53,7 @@ export function parseSocks5AuthReply(
 /** 构造 CONNECT 请求：[VER,CMD=1,RSV,ATYP=3(域名),LEN,HOST...,PORT_HI,PORT_LO]
  *  始终发送域名（ATYP=3），由代理侧负责 DNS 解析（等价 socks5h 语义）。 */
 export function buildSocks5ConnectRequest(host: string, port: number): Uint8Array {
-  const enc = new TextEncoder();
-  const h = enc.encode(host);
+  const h = TE.encode(host);
   if (h.length > 255) throw new Error("socks5: host too long");
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error("socks5: bad port " + port);
   const out = new Uint8Array(7 + h.length);
@@ -131,7 +133,7 @@ function ipv4ToBytes(host: string): Uint8Array | null {
  */
 export function buildSocks4ConnectRequest(host: string, port: number, userId?: string): Uint8Array {
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error("socks4: bad port " + port);
-  const uid = new TextEncoder().encode(userId ?? "");
+  const uid = TE.encode(userId ?? "");
   const ip = ipv4ToBytes(host);
   if (ip) {
     const out = new Uint8Array(9 + uid.length);
@@ -144,7 +146,7 @@ export function buildSocks4ConnectRequest(host: string, port: number, userId?: s
     out[8 + uid.length] = 0x00;
     return out;
   }
-  const h = new TextEncoder().encode(host);
+  const h = TE.encode(host);
   if (h.length > 255) throw new Error("socks4a: host too long");
   // v2.2.1 修复：分配长度此前写 9 + uid + 1 + host + 1（头长误算为 9），
   // 实际写入 8 字节头 + uid + NUL + host + NUL —— 多出的 1 字节零会被
@@ -208,12 +210,12 @@ export function buildHttpConnectRequest(host: string, port: number, username?: s
     head += "Proxy-Authorization: Basic " + cred + "\r\n";
   }
   head += "User-Agent: cf-vproxy\r\n" + "Proxy-Connection: keep-alive\r\n" + "\r\n";
-  return new TextEncoder().encode(head);
+  return TE.encode(head);
 }
 
 /** 解析 CONNECT 应答头块，返回 {ok, status, reason} */
 export function parseHttpConnectReply(block: Uint8Array): { ok: boolean; status: number; reason: string } {
-  const text = new TextDecoder().decode(block);
+  const text = TD.decode(block);
   const lineEnd = text.indexOf("\n");
   const statusLine = (lineEnd >= 0 ? text.slice(0, lineEnd) : text).trim();
   const m = /^HTTP\/\d(?:\.\d)?\s+(\d{3})(?:\s+(.*))?$/.exec(statusLine);
