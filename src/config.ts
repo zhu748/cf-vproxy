@@ -47,7 +47,9 @@ export function defaultConfig(env: Env): VProxyConfig {
     subscription: "",
     model_aliases: {},
     disabled_models: [],
-    subscription_refresh_minutes: 30,
+    // v2.5.1：默认每小时拉取（用户需求：每小时自动拉一次代理列表）。
+    // cron 每 15 分钟心跳一次，subscriptionDue 判距上次拉取 ≥60 分钟才真正拉。
+    subscription_refresh_minutes: 60,
     racing: { ...DEFAULT_RACING },
     drop_max_tokens: false,
     max_request_mb: 64,
@@ -82,7 +84,9 @@ export function sanitizeConfig(raw: unknown): VProxyConfig {
   const arr = (v: unknown): string[] =>
     Array.isArray(v) ? v.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim()) : [];
   let refresh = Number(d.subscription_refresh_minutes);
-  if (!Number.isFinite(refresh) || refresh < 5) refresh = 30;
+  // v2.5.1：非法/过小值的兑底同步 60（与 defaultConfig 一致；旧部署存了 30 的仍按 30 执行，
+  // 可在面板「配置」页改为 60，或删 KV config 键重初始化）
+  if (!Number.isFinite(refresh) || refresh < 5) refresh = 60;
   // 单 Key：优先读 gemini_key；旧配置只有 gemini_keys 数组时取第一个
   const geminiKey =
     typeof d.gemini_key === "string" && d.gemini_key.trim()

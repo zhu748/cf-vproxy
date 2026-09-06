@@ -41,12 +41,12 @@ test("sanitizeConfig: 自动剔除不支持的代理链接（https / vmess）并
 test("sanitizeConfig: 其它字段规范化", () => {
   const cfg = sanitizeConfig({
     subscription: " https://sub.example.com/x ",
-    subscription_refresh_minutes: 0, // 非法 → 回落 30
+    subscription_refresh_minutes: 0, // 非法 → 回落 60（v2.5.1 默认每小时拉取）
     model_aliases: { "gpt-4o": "gemini-3.7-flash", bad: 123 },
     disabled_models: ["m1", "", "m2"],
   });
   assert.equal(cfg.subscription, "https://sub.example.com/x");
-  assert.equal(cfg.subscription_refresh_minutes, 30);
+  assert.equal(cfg.subscription_refresh_minutes, 60);
   assert.deepEqual(cfg.model_aliases, { "gpt-4o": "gemini-3.7-flash" });
   assert.deepEqual(cfg.disabled_models, ["m1", "m2"]);
 });

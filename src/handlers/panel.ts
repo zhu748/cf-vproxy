@@ -580,7 +580,7 @@ LOADERS.cfg = function(){
     $("cfg-baseurl").value = j.gemini_base_url || "";
     $("cfg-maxn").value = j.max_n != null ? j.max_n : 8;
     $("cfg-sub").value = j.subscription || "";
-    $("cfg-sub-min").value = j.subscription_refresh_minutes || 30;
+    $("cfg-sub-min").value = j.subscription_refresh_minutes || 60;
     renderKeys(); renderAliases(); renderDisabled();
   }).catch(function(e){ if (e.message !== "NEED_LOGIN") toast("加载失败：" + e.message, "err"); });
 };
@@ -616,7 +616,7 @@ $("cfg-save").onclick = function(){
     max_n: Math.min(32, Math.max(1, parseInt($("cfg-maxn").value, 10) || 8)),
     api_keys: CFG.api_keys,
     subscription: $("cfg-sub").value.trim(),
-    subscription_refresh_minutes: Math.max(5, parseInt($("cfg-sub-min").value, 10) || 30),
+    subscription_refresh_minutes: Math.max(5, parseInt($("cfg-sub-min").value, 10) || 60),
     model_aliases: ALIASES,
     disabled_models: CFG.disabled_models
   };
