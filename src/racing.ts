@@ -274,6 +274,27 @@ export function averageLatency(healthMap: Map<string, ProxyHealth>, now: number)
   return count === 0 ? 500 : sum / count;
 }
 
+// ---------- v2.4.1：Key 级配额 429 识别（纯函数，Node 可单测） ----------
+
+/**
+ * 判断 429 响应体是否为「Key/项目级配额耗尽」而非节点级限流。
+ *
+ * 背景：本项目是单 Key 直连架构（上游只有一把 Gemini Key）。上游 429 有两类：
+ *   - Key 级：配额按 PerProject / PerModel 计（如免费层
+ *     GenerateRequestsPerDayPerProjectPerModel-FreeTier = 20 次/天/模型）——
+ *     换任何代理节点都无法绕过，继续竞速/接力只会用同一把 Key 继续烧计数；
+ *   - 节点级：出口 IP 短时限流（"Rate limit" / per-IP）—— 换节点确实有效。
+ * 命中 Key 级特征时应立即把 429 透传给客户端并停止全部在飞候选。
+ *
+ * 匹配特征（保守取交集，避免误杀节点级限流）：
+ *   - "exceeded your current quota"（Google 配额耗尽标准文案）
+ *   - "PerProject"（配额维度名，如 GenerateRequestsPerDayPerProjectPerModel）
+ *   - "FreeTier"（免费层配额 ID 后缀）
+ */
+export function isKeyLevelQuota429(bodyText: string): boolean {
+  return /exceeded your current quota|PerProject|FreeTier/i.test(bodyText);
+}
+
 /** v1.9.0：巡检选点 —— 「最久未测优先」轮转。
  * 旧版固定 `slice(0, batch)` 只反复测池子头部节点：200 节点的池子后 160 个
  * 永远不会被巡检探索（若头部 40 个全坏，巡检就永远因在死节点上）。
