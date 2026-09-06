@@ -5,12 +5,19 @@
 //   - readAvailable()       尽量读一些（EOF 返回 null）
 //   - tryParse(fn)          基于缓冲区的探测式解析（SOCKS 变长应答）
 // 纯运行时逻辑、无平台依赖，可在 Node 下直接单测。
+// v2.0：构造参数放宽为结构性接口 —— 允许注入 tls13 客户端等自定义字节源
+// （ReadableStreamDefaultReader 天然满足该接口）。
+export interface ByteSource {
+  read(): Promise<{ value?: Uint8Array; done: boolean }>;
+  releaseLock?(): void;
+}
+
 export class ByteBufReader {
   private buf: Uint8Array = new Uint8Array(0);
   private eof = false;
-  private reader: ReadableStreamDefaultReader<Uint8Array>;
+  private reader: ByteSource;
 
-  constructor(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  constructor(reader: ByteSource) {
     this.reader = reader;
   }
 
@@ -121,7 +128,7 @@ export class ByteBufReader {
   /** 释放底层 reader（不关闭流本身） */
   release(): void {
     try {
-      this.reader.releaseLock();
+      this.reader.releaseLock?.();
     } catch {
       // ignore
     }

@@ -17,12 +17,14 @@ import {
   readFullBody,
   writeTunnelRequest,
 } from "./httpclient.ts";
-import { httpConnectHandshake, releaseHandshake, socks4Handshake, socks5Handshake } from "./tunnel.ts";
+import { httpConnectHandshake, socks4Handshake, socks5Handshake } from "./tunnel.ts";
+import { Tls13Client } from "./tls13.ts";
 
 const SUB_CACHE_KEY = "proxy_cache";
 const MAX_PROXIES = 200;
 const CONNECT_TIMEOUT_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
+const TLS13_HANDSHAKE_TIMEOUT_MS = 12_000;
 
 // v1.6.0：订阅缓存与代理池的 isolate 内存缓存 ——
 // 此前每个业务请求都读一次 KV 订阅缓存 + 全量重新解析/去重代理 URL（免费计划 10 万读/天的
@@ -210,7 +212,8 @@ export async function viaProxy(p: ProxyEntry, url: string, init: RequestInit, si
   const targetHost = u.hostname;
   const targetPort = Number(u.port) || 443;
 
-  const sock = connect({ hostname: p.host, port: p.port }, { secureTransport: "starttls" } as SocketOptions);
+  // v2.0：纯 TCP（不再用 secureTransport:"starttls" —— startTls 已被 TLS 1.3 客户端替代）
+  const sock = connect({ hostname: p.host, port: p.port });
   const onAbort = () => closeQuietly(sock);
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
@@ -244,22 +247,35 @@ async function viaProxyInner(
     closeQuietly(sock);
     throw err;
   }
-  // v1.9.0：释放读写双锁 —— startTls 返回的 TLS socket 复用同一对流对象，
-  // 握手 writer 的写锁不释放会让下面 tlsSock.writable.getWriter() 拗 "currently locked to a writer"
-  releaseHandshake(hs);
 
-  // v1.6.0：startTls 抛错时同样关闭底层 socket（防泄漏）
-  let tlsSock: Socket;
+  // v2.0（TLS Handshake Failed 根因修复）：
+  //   边缘的 socket.startTls() 无法在承载过代理握手流量的 socket 上完成 TLS 升级
+  //   （部署在真实边缘的诊断 Worker 分步实测 100% 复现；同一隧道上手写 ClientHello
+  //   可正常收到 Google 的 ServerHello —— 字节层完全透明，仅 startTls 路径坏死）。
+  //   因此弃用 startTls，改为在隧道字节流上直接运行纯 JS 实现的 TLS 1.3 客户端
+  //   （X25519 + AES-128-GCM + HKDF 全部走 WebCrypto 原生算子；证书链固定 GTS 根 +
+  //   SAN + CertificateVerify 完整校验，免费代理池中的 MITM 节点会被直接拒绝）。
+  //   握手读写直接复用代理握手期的 reader/writer（残留缓冲字节不丢失），
+  //   也不再需要 v1.9.0 的 releaseHandshake 释放锁逻辑。
+  const tls = new Tls13Client(hs.reader, hs.writer, {
+    serverName: targetHost,
+    onClose: () => closeQuietly(sock),
+  });
   try {
-    tlsSock = sock.startTls({ expectedServerHostname: targetHost });
+    await withTimeout(tls.handshake(), TLS13_HANDSHAKE_TIMEOUT_MS, "tls13 handshake timeout (" + p.host + ":" + p.port + ")");
   } catch (err) {
     closeQuietly(sock);
     throw err;
   }
-  const onTlsAbort = () => closeQuietly(tlsSock);
+  const onTlsAbort = () => tls.close();
   signal?.addEventListener("abort", onTlsAbort, { once: true });
-  const writer = tlsSock.writable.getWriter();
-  const reader = new ByteBufReader(tlsSock.readable.getReader());
+  const writer: { write(chunk: Uint8Array): Promise<void> } = {
+    write: (chunk: Uint8Array) => tls.write(chunk),
+  };
+  const reader = new ByteBufReader({
+    read: () => tls.read().then((v) => (v === null ? { done: true, value: undefined } : { done: false, value: v })),
+    releaseLock: () => {},
+  });
 
   const headers: Record<string, string> = {};
   const inHeaders = new Headers(init.headers ?? {});
@@ -286,13 +302,13 @@ async function viaProxyInner(
     }
     const cleanup = () => {
       signal?.removeEventListener("abort", onTlsAbort);
-      closeQuietly(tlsSock);
+      tls.close();
     };
     const body = makeBodyStream(reader, shape, cleanup);
     return new Response(body, { status: head.status, statusText: head.reason, headers: outHeaders });
   } catch (err) {
     signal?.removeEventListener("abort", onTlsAbort);
-    closeQuietly(tlsSock);
+    tls.close();
     throw err;
   }
 }

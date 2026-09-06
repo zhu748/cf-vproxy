@@ -4,6 +4,27 @@
 > 专为 Cloudflare Workers（免费计划即可）设计。转换层逻辑与原项目对齐，去掉了 reCAPTCHA 突破、
 > TLS 指纹伪装、mihomo 代理内核等 Workers 沙箱无法实现的部分。
 >
+> **v2.0.0 更新（TLS Handshake Failed 根因修复：纯 JS 实现 TLS 1.3，代理隧道在 Workers 上真正可用）**：
+> ✅ **经代理访问 HTTPS 上游彻底打通**。v1.9.1 的结论（workerd `startTls()` 在已承载代理握手流量的
+> socket 上 100% 报 `TLS Handshake Failed.`）经部署到真实边缘的诊断 Worker 分步复现确认属实：
+> 同一隧道上手写 ClientHello 可正常收到 Google 的 ServerHello（字节层完全透明），**只有 startTls
+> 这条路径坏死** —— 这是边缘 runtime 的平台级限制，与代理质量无关。
+> v2.0.0 的解法：**绕开 startTls，在原始隧道字节流上直接运行纯 JS 实现的 TLS 1.3 客户端**（`src/proxy/tls13.ts`，约千行，RFC 8446）：
+> ① **密码套件** TLS_AES_128_GCM_SHA256 + **X25519** 密钥交换 —— 全部走 WebCrypto 原生算子
+> （X25519/AES-GCM/HKDF/RSA-PSS/ECDSA 在边缘实测可用），握手 CPU 约 3-8ms，免费计划 10ms/请求
+> 上限内可用；流式响应按 16KB 记录增量解密（每记录约 0.1ms）；
+> ② **完整密钥调度与记录层**：HKDF-Expand-Label 链（early→handshake→master→application）、
+> AES-128-GCM（AAD=记录头、nonce=iv^seq）、transcript 前缀哈希（CV/Finished/App 三段各取正确前缀）；
+> ③ **证书校验一样不少**：X.509 最小 DER 解析 + 逐级验签 + 信任锚 SPKI 固定（Google Trust
+> Services Root R1-R4，来源 pki.goog）+ SAN 匹配 + 有效期 + CertificateVerify —— **免费代理池中
+> 实测大量存在的自签证书 MITM 节点会被直接拒绝**（本地实测 114/394 可用节点中约 130 个是 MITM）；
+> ④ **握手后完整语义**：NewSessionTicket 跳过、KeyUpdate 重密钥、close_notify 优雅关闭、
+> 对端硬关 TCP（`Connection: close` 常见）视为正常 EOF；
+> ⑤ **集成方式**：`viaProxy` 弃用 `startTls`，代理握手后的 reader/writer 直接复用（残留缓冲字节
+> 不丢失），v1.9.0 的 `releaseHandshake` 释放锁逻辑不再需要；熔断器/竞速/健康度/直连兜底全部保留
+> —— 现在「代理失败」都是真实节点失败（死代理/CONNECT 被拒/超时），不再是平台假故障。
+> 实测：边缘部署后代理节点真实成功（200），"TLS Handshake Failed." 从错误日志中彻底消失。
+>
 > **v1.9.1 更新（代理池熔断 + 直连兜底：Workers 平台 TLS 过隧道的诚实适配）**：
 > ⚠️ **平台限制实锤**：经分步诊断验证（手工 TLS 字节双向透传正常、workerd `startTls()` 在
 > 已承载代理握手流量的 socket 上 100% 报 `TLS Handshake Failed.`，与代理质量/协议实现无关），

@@ -18,9 +18,11 @@ export interface ResponseHead {
   headers: Record<string, string>;
 }
 
-/** 写出 HTTP/1.1 请求（Content-Length 固定，body 必须已知长度） */
+/** 写出 HTTP/1.1 请求（Content-Length 固定，body 必须已知长度）
+ * v2.0：writer 放宽为结构性接口 —— 既接受 WritableStreamDefaultWriter，也接受
+ * tls13 客户端的 write 适配器（代理隧道上的纯 JS TLS 层）。 */
 export async function writeTunnelRequest(
-  writer: WritableStreamDefaultWriter<Uint8Array>,
+  writer: { write(chunk: Uint8Array): Promise<void> },
   req: TunnelRequest,
 ): Promise<void> {
   const u = new URL(req.url);
