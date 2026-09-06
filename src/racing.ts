@@ -174,17 +174,25 @@ export function cooldownSecondsFor(consecFail: number): number {
 
 export const RATE_LIMIT_COOLDOWN_SEC = 30;
 
-/** 计数衰减：量大时对半，防止长期运行后成功率失真（对齐原项目 decayHealthCounters） */
+/** 计数衰减：量大时对半，防止长期运行后成功率失真（对齐原项目 decayHealthCounters）
+ *  v2.5.1：rate_limit_count 一并衰减 —— 否则 429 惩罚会永久压低节点分数。 */
 function decayCounters(h: ProxyHealth): void {
-  if (h.success <= 1000 && h.fail <= 200) return;
+  if (h.success <= 1000 && h.fail <= 200 && h.rate_limit_count <= 8) return;
   h.success = Math.floor(h.success / 2);
   h.fail = Math.floor(h.fail / 2);
+  h.rate_limit_count = Math.floor(h.rate_limit_count / 2);
 }
 
 /**
  * 节点健康分（越高越优先）：
  *   - 未测试节点固定 80 分（探索档，永远排在已验证节点之后）；
- *   - 已验证节点 = 60 基础分 + 20*成功率 + 延迟加分(0~20) - 8*连败(封顶5) + 粘性加分15。
+ *   - 已验证节点 = 60 基础分 + 20*成功率 + 延迟加分(0~20) - 8*连败(封顶5) + 粘性加分15
+ *     - v2.5.1 429 惩罚：- 5*min(rate_limit_count, 6)（最多 -30）。
+ *       单 IP 滑动窗口限流（每 IP 独立 20 次/窗口）下，top_k 竞速总挑「最近成功」的
+ *       节点 —— 恰是窗口刚耗尽的节点：撞 429 → 冷却 ~20s → 恢复 → 又被选中 → 循环，
+ *       池里其余几百个节点永远轮不到。计次惩罚让频繁撞墙的节点短期让位，流量
+ *       分散到全池（375+ 节点轮换 ≈ 接近无限额度）；计数由 decayCounters 周期减半
+ *       清理，节点长期正常服务后自动回到高位。
  */
 export function healthScore(h: ProxyHealth | undefined, now: number): number {
   if (isCooling(h, now)) return 0; // 冷却中（防御：优先于未测试判断）
@@ -193,8 +201,9 @@ export function healthScore(h: ProxyHealth | undefined, now: number): number {
   const rate = total > 0 ? h.success / total : 0;
   const latencyBonus = clamp(20 - h.avg_ms / 50, 0, 20); // 1000ms+ → 0 分，0ms → 20 分
   const failPenalty = 8 * Math.min(h.consec_fail, 5);
+  const rlPenalty = 5 * Math.min(h.rate_limit_count, 6);
   const stickyBonus = h.sticky ? 15 : 0;
-  return 60 + 20 * rate + latencyBonus - failPenalty + stickyBonus;
+  return 60 + 20 * rate + latencyBonus - failPenalty - rlPenalty + stickyBonus;
 }
 
 export function isCooling(h: ProxyHealth | undefined, now: number): boolean {
@@ -209,10 +218,15 @@ export interface CandidateLike {
 
 /**
  * 选择竞速候选（对齐原项目 SelectForParallel 语义）：
- *   1. 已验证且未冷却的节点按健康分降序取前 top_k；
- *   2. 未测试节点最多给 2 个探索名额（排在已验证节点之后）；
- *   3. 冷却节点按「最早恢复」排序垫底兜底；
- *   4. 总数不超过 max_attempts。
+ *   1. 健康分 ≥ 未测试档（80）的已验证节点按降序取前 top_k；
+ *   2. 未测试节点最多给 2 个探索名额；
+ *   3. v2.5.1 降级让位：被 429 计次/连败惩罚压到 80 分以下的已验证节点，排在
+ *      未测试节点**之后**（原实现已验证节点无条件占 top_k 坑 —— 单 IP 窗口限流下
+ *      top_k 竞速反复撞同一批「窗口刚耗尽」的节点，池里几百个新鲜 IP 永远轮不到；
+ *      降级让位 + 未测试探索 = 全池轮换 ≈ 接近无限额度）。降级节点仍排在冷却
+ *      节点之前垫底（比冷却节点先恢复可用）；
+ *   4. 冷却节点按「最早恢复」排序垫底兜底；
+ *   5. 总数不超过 max_attempts。
  */
 export function selectCandidates<T extends CandidateLike>(
   entries: T[],
@@ -241,15 +255,23 @@ export function selectCandidates<T extends CandidateLike>(
   verified.sort((a, b) => b.score - a.score);
   cooling.sort((a, b) => a.recoverAt - b.recoverAt);
 
+  // v2.5.1：健康档（≥80，与未测试同档）优先占 top_k；降级档（<80）让位给未测试节点
+  const strong = verified.filter((v) => v.score >= 80);
+  const demoted = verified.filter((v) => v.score < 80);
+
   const out: T[] = [];
   const cap = Math.max(1, cfg.max_attempts);
-  for (const v of verified) {
+  for (const v of strong) {
     if (out.length >= Math.min(cap, Math.max(1, cfg.top_k))) break;
     out.push(v.e);
   }
   for (const u of untested) {
     if (out.length >= Math.min(cap, Math.max(1, cfg.top_k) + 2)) break; // 最多 2 个探索名额
     out.push(u);
+  }
+  for (const v of demoted) {
+    if (out.length >= cap) break;
+    out.push(v.e);
   }
   if (out.length === 0) {
     // 全部冷却：让最早恢复的节点兜底，避免直接放弃

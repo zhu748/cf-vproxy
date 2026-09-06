@@ -8,7 +8,17 @@
 //     换代理节点立即可用 —— 必须判 per-ip 轮转，而不是透传 429。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classify429Body, parse429RetryAfterSecs, recordProxyRateLimit, proxyHealth } from "../src/racing.ts";
+import {
+  classify429Body,
+  parse429RetryAfterSecs,
+  recordProxyRateLimit,
+  proxyHealth,
+  healthScore,
+  selectCandidates,
+  emptyHealth,
+  type ProxyHealth,
+  type RacingConfig,
+} from "../src/racing.ts";
 
 // 用户线上实测样本（v2.4.1 误判为 Key 级 → 硬失败，v2.5.0 必须判 per-ip 可轮转）
 const USER_RPM = [
@@ -130,4 +140,70 @@ test("recordProxyRateLimit: 上游明示 20.46s → 冷却 23s（+2s 缓冲）�
 
   recordProxyRateLimit(uri, now + 2000, 500); // 超上限（parse 已挡 300+，此处防御 clamp）
   assert.equal(proxyHealth(uri)!.cooldown_until - Math.floor((now + 2000) / 1000), 120);
+});
+
+// ---------- v2.5.1：429 计次惩罚 + 降级让位（全池轮换 ≈ 接近无限额度） ----------
+
+const RACING_CFG: RacingConfig = { enabled: true, top_k: 6, max_concurrent: 3, hedge_delay_ms: 1000, dynamic_delay: false, max_attempts: 8, node_retry: true };
+const NOW = Date.now();
+
+function mkHealth(partial: Partial<ProxyHealth>): ProxyHealth {
+  return { ...emptyHealth(), ...partial };
+}
+
+test("healthScore: 429 计次惩罚 -5×count（封顶 6 次 = -30）；未测试档 80 不受影响", () => {
+  const clean = mkHealth({ success: 10, fail: 0, last_ms: 200, avg_ms: 200, last_success_at: Math.floor(NOW / 1000), sticky: true });
+  const base = healthScore(clean, NOW);
+  assert.ok(base > 95); // 满血：60 + 20 + ~16 + 15
+  assert.equal(healthScore(undefined, NOW), 80); // 未测试档
+
+  const rl1 = mkHealth({ ...clean, rate_limit_count: 1 });
+  assert.ok(Math.abs((base - healthScore(rl1, NOW)) - 5) < 1e-9);
+  const rl6 = mkHealth({ ...clean, rate_limit_count: 6 });
+  const rl9 = mkHealth({ ...clean, rate_limit_count: 9 }); // 封顶
+  assert.ok(Math.abs((base - healthScore(rl6, NOW)) - 30) < 1e-9);
+  assert.equal(healthScore(rl6, NOW), healthScore(rl9, NOW));
+});
+
+test("selectCandidates: 被 429 惩罚降级（<80）的已验证节点让位给未测试节点", () => {
+  // 满血但撞了 6 次 429 的节点（base≈111 - 30 ≈ 81？构造降级更彻底：低成功率 + 429）
+  const exhausted = mkHealth({
+    success: 20, fail: 4, last_ms: 300, avg_ms: 300,
+    last_success_at: Math.floor(NOW / 1000), rate_limit_count: 8,
+  }); // 60 + 20*0.83 + 14 - 30 ≈ 60.7 → 降级
+  assert.ok(healthScore(exhausted, NOW) < 80);
+
+  const healthy = mkHealth({ success: 30, fail: 0, last_ms: 150, avg_ms: 150, last_success_at: Math.floor(NOW / 1000) });
+  const entries = [
+    { raw: "http://exhausted-rl:8080" },
+    { raw: "http://healthy:1080" },
+    { raw: "http://fresh-untested-a:1080" },
+    { raw: "http://fresh-untested-b:1080" },
+    { raw: "http://fresh-untested-c:1080" },
+  ];
+  const hm = new Map<string, ProxyHealth>([
+    ["http://exhausted-rl:8080", exhausted],
+    ["http://healthy:1080", healthy],
+  ]);
+  const picked = selectCandidates(entries, hm, RACING_CFG, NOW).map((p) => p.raw);
+  // healthy（strong 档）先选，3 个未测试节点补探索坑，撞墙节点（降级档）垫底
+  assert.ok(picked.indexOf("http://healthy:1080") < picked.indexOf("http://exhausted-rl:8080"));
+  assert.ok(picked.indexOf("http://fresh-untested-a:1080") < picked.indexOf("http://exhausted-rl:8080"));
+  assert.ok(picked.indexOf("http://fresh-untested-b:1080") < picked.indexOf("http://exhausted-rl:8080"));
+  assert.ok(picked.includes("http://exhausted-rl:8080")); // 候选不足 cap 时降级节点仍兜底（先于冷却档）
+});
+
+test("selectCandidates: strong 档已验证节点仍优先于未测试（不因探索饿死健康节点）", () => {
+  const healthy = mkHealth({ success: 30, fail: 0, last_ms: 150, avg_ms: 150, last_success_at: Math.floor(NOW / 1000) });
+  const entries = [
+    { raw: "http://u-a:1" }, { raw: "http://u-b:2" }, { raw: "http://u-c:3" },
+    { raw: "http://u-d:4" }, { raw: "http://u-e:5" }, { raw: "http://u-f:6" },
+    { raw: "http://strong:1080" },
+  ];
+  const hm = new Map<string, ProxyHealth>([["http://strong:1080", healthy]]);
+  const picked = selectCandidates(entries, hm, RACING_CFG, NOW).map((p) => p.raw);
+  // strong 唯一健康节点必须入选且先于未测试
+  assert.ok(picked.includes("http://strong:1080"));
+  assert.ok(picked.indexOf("http://strong:1080") < picked.indexOf("http://u-a:1"));
+  assert.ok(picked.length <= RACING_CFG.max_attempts);
 });
