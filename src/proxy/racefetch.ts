@@ -36,6 +36,7 @@ import {
   healthScore,
   isCooling,
   classify429Body,
+  isSuspiciousAuthError,
   type Quota429Class,
   proxyHealth,
   recordProxyFailure,
@@ -94,6 +95,22 @@ async function absorb429(resp: Response): Promise<{ resp: Response; cls: Quota42
   return { resp: rebuilt, cls };
 }
 
+/** v2.5.3：读入非 429 的 4xx 响应体，判断是否为「代理伪造的密钥级错误」
+ * （劫持节点 30ms 回伪造错误骗首胜即停 —— 详见 racing.ts SUSPICIOUS_AUTH_ERROR_SIGNATURE）。
+ * 体过大的异常 4xx 不读，按非可疑处理（防御恶意代理巨型错误页）。 */
+async function absorb4xx(resp: Response): Promise<{ resp: Response; suspect: boolean }> {
+  const cl = Number(resp.headers.get("content-length") ?? "0");
+  if (Number.isFinite(cl) && cl > 65_536) return { resp, suspect: false };
+  let body = "";
+  try {
+    body = await resp.text(); // 小体；完整消费后连接可回池
+  } catch {
+    return { resp, suspect: false };
+  }
+  const suspect = isSuspiciousAuthError(body);
+  return { resp: new Response(body, { status: resp.status, statusText: resp.statusText, headers: resp.headers }), suspect };
+}
+
 // ---------- 健康感知的轮换顺序模式 ----------
 
 function healthyOrder(entries: ProxyPool["entries"]): ProxyPool["entries"] {
@@ -115,6 +132,8 @@ interface NodeAttempt {
   ms: number;
   /** v2.5.0：本响应是 429 时的分类（per-ip 窗口限流 / project 每日配额） */
   q429?: Quota429Class;
+  /** v2.5.3：非 429 的 4xx 响应体命中「可疑密钥级错误」特征（代理伪造嫌疑） */
+  suspect4xx?: boolean;
 }
 
 async function attemptOnce(p: { raw: string }, url: string, init: RequestInit): Promise<NodeAttempt> {
@@ -124,6 +143,10 @@ async function attemptOnce(p: { raw: string }, url: string, init: RequestInit): 
     if (resp.status === 429) {
       const r = await absorb429(resp);
       return { resp: r.resp, ms: Date.now() - started, q429: r.cls };
+    }
+    if (resp.status >= 400 && resp.status < 500) {
+      const r = await absorb4xx(resp);
+      return { resp: r.resp, ms: Date.now() - started, suspect4xx: r.suspect };
     }
     return { resp, ms: Date.now() - started };
   } catch (err) {
@@ -171,6 +194,8 @@ export async function rotateUpstream(
   const maxTry = Math.min(order.length, 3);
   const errors: string[] = [];
   const retried = new Set<string>();
+  // v2.5.3：可疑密钥级错误首个命中接力验证，第二个节点同类错误才透传（真实）
+  let seenSuspect = false;
   const start = order.length > 0 ? rrCursor % order.length : 0;
   rrCursor = (rrCursor + 1) % Math.max(1, order.length);
   for (let i = 0; i < maxTry; i++) {
@@ -202,7 +227,16 @@ export async function rotateUpstream(
       continue;
     }
     if (r.resp) {
-      // 请求级 4xx：与代理无关，直接返回（原项目语义：不惩罚节点、不接力）
+      // 请求级 4xx：与代理无关，直接返回（原项目语义：不惩罚节点、不接力）。
+      // v2.5.3 例外：密钥级错误特征可疑（劫持节点伪造骗首胜）—— 首次命中记失败
+      // 并接力下一节点验证；第二个节点仍同类错误才判真实透传。
+      if (r.suspect4xx && !seenSuspect) {
+        seenSuspect = true;
+        recordProxyFailure(p.raw, "suspicious auth error (likely forged by proxy)");
+        errors.push("[" + p.raw + "] suspicious auth error → 接力验证");
+        void r.resp.body?.cancel().catch(() => {});
+        continue;
+      }
       return { response: r.resp, via: p.raw };
     }
     recordProxyFailure(p.raw, r.error ?? "network error");
@@ -218,7 +252,7 @@ export async function rotateUpstream(
 
 // ---------- 对冲竞速模式 ----------
 
-type AttemptKind = "ok" | "ratelimit" | "retryable" | "hard" | "aborted";
+type AttemptKind = "ok" | "ratelimit" | "retryable" | "hard" | "hard-suspect" | "aborted";
 
 interface AttemptResult {
   kind: AttemptKind;
@@ -250,8 +284,18 @@ async function runAttempt(p: { raw: string }, url: string, init: RequestInit, si
       return { kind: "ratelimit", resp: r.resp, ms, retryAfterSecs: r.cls.retryAfterSecs };
     }
     const kind = classifyStatus(resp.status);
-    if (kind === "ok") recordProxySuccess(p.raw, ms);
-    else if (kind === "retryable") recordProxyFailure(p.raw, "HTTP " + resp.status);
+    if (kind === "ok") {
+      recordProxySuccess(p.raw, ms);
+      return { kind, resp, ms };
+    }
+    if (kind === "hard") {
+      // v2.5.3：密钥级错误特征可疑（劫持节点 30ms 回伪造错误骗首胜即停）→
+      // hard-suspect 不立即胜出，交由 onResult 记失败并接力验证
+      const r = await absorb4xx(resp);
+      if (r.suspect) return { kind: "hard-suspect", resp: r.resp, ms };
+      return { kind, resp: r.resp, ms };
+    }
+    if (kind === "retryable") recordProxyFailure(p.raw, "HTTP " + resp.status);
     return { kind, resp, ms };
   } catch (err) {
     const ms = Date.now() - started;
@@ -298,6 +342,11 @@ export async function raceUpstream(
             if (again) return { response: again, via: only.raw };
           }
         }
+        else if (kind === "hard" && r.suspect4xx) {
+          // v2.5.3：单候选无法二次验证 —— 记失败（下个请求不再选该伪造嫌疑节点），
+          // 本次仍透传（上层直连兜底可在熔断打开时给出可信结论）
+          recordProxyFailure(only.raw, "suspicious auth error (likely forged by proxy)");
+        }
         return { response: r.resp, via: only.raw };
       }
       recordProxyFailure(only.raw, r.error ?? "network error");
@@ -323,6 +372,8 @@ export async function raceUpstream(
     const errors: string[] = [];
     const controllers = new Map<string, AbortController>();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // v2.5.3：可疑密钥级错误首中接力验证；第二个节点同类错误（独立出口一致）才判真实
+    let suspectHits = 0;
 
     const cleanupTimer = () => {
       if (timer) {
@@ -398,6 +449,29 @@ export async function raceUpstream(
         // 请求级 4xx：与代理无关，立即返回（不计惩罚，已在 runAttempt 跳过记录）
         abortLosers();
         finish(() => resolve({ response: res.resp!, via: p.raw }));
+        return;
+      }
+      if (res.kind === "hard-suspect") {
+        // v2.5.3：密钥级错误可疑（劫持节点伪造骗首胜）—— 首中：记失败（连败冷却
+        // 让伪造者出局）+ 接力下一节点验证；第二个节点同类错误才判真实胜出透传。
+        suspectHits++;
+        if (suspectHits >= 2) {
+          abortLosers();
+          finish(() => resolve({ response: res.resp!, via: p.raw }));
+          return;
+        }
+        recordProxyFailure(p.raw, "suspicious auth error (likely forged by proxy)");
+        errors.push("[" + p.raw + "] suspicious auth error → relay to verify");
+        // 无候选可接力（单候选/已耗尽且无在飞）→ 透传该疑似响应兜底
+        if (nextIdx >= candidates.length && active === 0) {
+          const resp = res.resp;
+          const via = p.raw;
+          finish(() => resolve({ response: resp!, via }));
+          return;
+        }
+        dropResp(res.resp);
+        launch();
+        scheduleHedge();
         return;
       }
 

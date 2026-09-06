@@ -16,6 +16,7 @@ import {
   healthScore,
   selectCandidates,
   emptyHealth,
+  isSuspiciousAuthError,
   type ProxyHealth,
   type RacingConfig,
 } from "../src/racing.ts";
@@ -206,4 +207,25 @@ test("selectCandidates: strong 档已验证节点仍优先于未测试（不因�
   assert.ok(picked.includes("http://strong:1080"));
   assert.ok(picked.indexOf("http://strong:1080") < picked.indexOf("http://u-a:1"));
   assert.ok(picked.length <= RACING_CFG.max_attempts);
+});
+
+// ---------- v2.5.3：可疑密钥级错误（代理伪造检测） ----------
+
+test("isSuspiciousAuthError: 线上实测伪造样本 / 各类密钥级错误特征命中", () => {
+  // 线上实测：同一密钥 429 限流中（有效）却收到 service account 被删错误 → 代理伪造
+  assert.ok(isSuspiciousAuthError(
+    JSON.stringify({ error: { code: 400, message: "The bound service account is deleted or disabled. The service account bound to the API key must be active.", status: "FAILED_PRECONDITION" } }),
+  ));
+  assert.ok(isSuspiciousAuthError("API key not valid. Please pass a valid API key."));
+  assert.ok(isSuspiciousAuthError("API key expired. Please renew."));
+  assert.ok(isSuspiciousAuthError("Permission denied: service account does not have permission"));
+  assert.ok(isSuspiciousAuthError("API_KEY_INVALID"));
+});
+
+test("isSuspiciousAuthError: 请求级/限流类 4xx 与空体不误报", () => {
+  assert.ok(!isSuspiciousAuthError("Invalid JSON payload received. Unknown name."));
+  assert.ok(!isSuspiciousAuthError(USER_RPM)); // 429 限流文案不含密钥失效特征
+  assert.ok(!isSuspiciousAuthError("GenerateRequestsPerMinutePerProjectPerModel"));
+  assert.ok(!isSuspiciousAuthError(""));
+  assert.ok(!isSuspiciousAuthError("<html><body>400 Bad Request</body></html>"));
 });

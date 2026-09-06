@@ -351,6 +351,28 @@ export function classify429Body(bodyText: string): Quota429Class {
   return { level: "per-ip" };
 }
 
+// ---------- v2.5.3：可疑上游鉴权错误（公共代理池劫持节点伪造检测） ----------
+
+/**
+ * 密钥/账号级错误特征 —— 公共代理池中的劫持节点最爱伪造这类错误（30ms 即回，
+ * 骗竞速「首胜即停」直接透传，让客户端误以为密钥失效而放弃或换 Key）。
+ *
+ * 判定依据（线上实测案例）：同一密钥几分钟内先收到标准 429（RESOURCE_EXHAUSTED
+ * 含 free_tier 计量 —— 限流中但密钥有效），随后却收到 "The bound service account
+ * is deleted or disabled"。密钥经用户在 Google 后台确认一直有效 → 后者只能来自
+ * 代理伪造。
+ *
+ * 策略：首个命中不做硬错误立即透传，而是记失败（连败冷却让伪造者出局）并接力
+ * 下一节点验证 —— 第二个节点仍返回同类错误（两个独立出口一致）才视为真实错误
+ * 透传；全部候选失败时上层熔断兜底直连（直连返回的才是可信结论）。
+ */
+export const SUSPICIOUS_AUTH_ERROR_SIGNATURE =
+  /service account[^.\n]{0,60}(deleted|disabled)|(?:API[_ ]?key)[^.\n]{0,30}(not valid|invalid|expired)|API_KEY_INVALID|permission[_\s-]?denied[^.\n]{0,60}service account/i;
+
+export function isSuspiciousAuthError(bodyText: string): boolean {
+  return SUSPICIOUS_AUTH_ERROR_SIGNATURE.test(bodyText);
+}
+
 /** v1.9.0：巡检选点 —— 「最久未测优先」轮转。
  * 旧版固定 `slice(0, batch)` 只反复测池子头部节点：200 节点的池子后 160 个
  * 永远不会被巡检探索（若头部 40 个全坏，巡检就永远因在死节点上）。
