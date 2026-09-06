@@ -447,6 +447,21 @@ async function verifySignature(
   );
 }
 
+/** HKDF-Expand-Label 的十六进制工具（链验签缓存键） */
+function toHex(bytes: Uint8Array): string {
+  let s = "";
+  for (const b of bytes) s += b.toString(16).padStart(2, "0");
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// v2.1 证书链验签缓存（isolate 级）：键 = 整链 DER 的 SHA-256 hex，值 = 结论有效期（epoch ms）。
+// Google 的证书链在叶子证书 ~90 天生命周期内字节不变；同链重复验签（2-3 次非对称验签，
+// 约 2-4ms CPU）是握手 CPU 大头，缓存后同 isolate 的后续握手直接跳过。
+// ---------------------------------------------------------------------------
+const CHAIN_CACHE_MAX = 32;
+const chainVerifyCache = new Map<string, number>();
+
 // ---------------------------------------------------------------------------
 // 记录层加解密（AES-128-GCM，AAD=记录头 5 字节，nonce = iv XOR seq）
 // ---------------------------------------------------------------------------
@@ -601,6 +616,27 @@ export class Tls13Client {
     await this.writer.write(concatBytes([head, ct]));
   }
 
+  /** v2.1：批量发送加密记录 —— 多条记录并行加密（预计算 nonce）后合并为单次底层写。
+   * 大请求体（如 1MB = 64 条记录）从「64 轮串行 encrypt→await write」变为
+   * 「64 个并行 encrypt + 1 次写」：省去 63 次 await 往返与逐条写带来的 TCP 小包。
+   * 分批上限 256 条（约 4MB 密文）以约束峰值内存。 */
+  private async writeRecordsBatch(innerType: number, payloads: Uint8Array[]): Promise<void> {
+    if (!this.cKeys.key) this.fail("write before client keys installed");
+    // map 回调同步执行：先按当前 seq 逐条预取 nonce（每条递增），再并行加密
+    const parts = await Promise.all(payloads.map((payload) => {
+      const nonce = this.cKeys.nonce();
+      this.cKeys.seq++;
+      const inner = concatBytes([payload, new Uint8Array([innerType])]);
+      const len = inner.length + 16;
+      const head = new Uint8Array([0x17, 0x03, 0x03, (len >> 8) & 0xff, len & 0xff]);
+      return crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce as unknown as ArrayBuffer, additionalData: head as unknown as ArrayBuffer, tagLength: 128 },
+        this.cKeys.key!, inner as unknown as ArrayBuffer,
+      ).then((ct) => concatBytes([head, new Uint8Array(ct)]));
+    }));
+    await this.writer.write(concatBytes(parts));
+  }
+
   // ---- 握手消息重组 ----
 
   private feedHsBuf(data: Uint8Array): void {
@@ -666,15 +702,21 @@ export class Tls13Client {
       { name: "X25519", public: serverPubKey } as unknown as { name: string }, x25519.privateKey, 256,
     ));
     const zeros32 = new Uint8Array(32);
-    const emptyHash = await sha256(new Uint8Array(0));
-    const earlySecret = await hkdfExtract(zeros32, zeros32);
+    // v2.1 优化：早期密钥调度与 transcript 哈希相互独立，并行执行
+    // （th1 只依赖 CH..SH；early/derived/hs 链只依赖 shared secret）
+    const [emptyHash, th1, earlySecret] = await Promise.all([
+      sha256(new Uint8Array(0)),
+      this.transcriptHash(),
+      hkdfExtract(zeros32, zeros32),
+    ]);
     const derived1 = await hkdfExpandLabel(earlySecret, "derived", emptyHash, 32);
     const hsSecret = await hkdfExtract(derived1, shared);
-    const th1 = await this.transcriptHash();
-    const cHs = await hkdfExpandLabel(hsSecret, "c hs traffic", th1, 32);
-    const sHs = await hkdfExpandLabel(hsSecret, "s hs traffic", th1, 32);
-    await this.cKeys.install(cHs);
-    await this.sKeys.install(sHs);
+    // v2.1 优化：c/s 握手流量密钥推导并行 + 两套 TrafficKeys 安装并行
+    const [cHs, sHs] = await Promise.all([
+      hkdfExpandLabel(hsSecret, "c hs traffic", th1, 32),
+      hkdfExpandLabel(hsSecret, "s hs traffic", th1, 32),
+    ]);
+    await Promise.all([this.cKeys.install(cHs), this.sKeys.install(sHs)]);
     this.serverKeysInstalled = true;
     this.clientKeysInstalled = true;
 
@@ -725,44 +767,55 @@ export class Tls13Client {
     if (!ee || !certMsg || !cvMsg || !sfMsg) this.fail("incomplete server flight");
 
     // 5. 证书链校验 + CertificateVerify + Finished
-    const certs = parseTlsCertificate(certMsg.body);
-    if (certs.length < 1) this.fail("empty certificate chain");
-    const leaf = parseCertificate(certs[0]);
-    await this.validateChain(certs, leaf);
-
+    // v2.1 优化：链验签与 transcript 哈希/CV 内容构造完全独立，整体并行执行
     const cvAlg = (cvMsg.body[0] << 8) | cvMsg.body[1];
     const cvSigLen = (cvMsg.body[2] << 8) | cvMsg.body[3];
     const cvSig = cvMsg.body.slice(4, 4 + cvSigLen);
-    const thCV = await sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeCv))); // CH..Certificate
-    const thSF = await sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeSf))); // CH..CV
+    const certs = parseTlsCertificate(certMsg.body);
+    if (certs.length < 1) this.fail("empty certificate chain");
+    const leaf = parseCertificate(certs[0]);
+    const emptyU8 = new Uint8Array(0);
+    // v2.1 优化：链验签与 transcript 哈希/finished 密钥推导完全独立，并行执行
+    const [, thCV, thSF, sFinKey] = await Promise.all([
+      this.validateChain(certs, leaf),
+      sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeCv))), // CH..Certificate
+      sha256(concatBytes(this.transcript.slice(0, transcriptLenBeforeSf))), // CH..CV
+      hkdfExpandLabel(sHs, "finished", emptyU8, 32),
+    ]);
     const cvContent = concatBytes([
       new Uint8Array(64).fill(0x20),
       te.encode("TLS 1.3, server CertificateVerify"),
       new Uint8Array([0]),
       thCV,
     ]);
-    const cvOk = await this.verifyTlsSignature(cvContent, cvSig, cvAlg, leaf);
+    // v2.1 优化：CV 验签与 SF HMAC 并行
+    const [cvOk, sfVerify] = await Promise.all([
+      this.verifyTlsSignature(cvContent, cvSig, cvAlg, leaf),
+      hmacSha256(sFinKey, thSF),
+    ]);
     if (!cvOk) this.fail("CertificateVerify signature invalid (possible MITM)");
-
-    const sFinKey = await hkdfExpandLabel(sHs, "finished", new Uint8Array(0), 32);
-    const sfVerify = await hmacSha256(sFinKey, thSF);
     const sfData = sfMsg.body.slice(0, 32);
     if (!eqBytes(sfVerify, sfData)) this.fail("server Finished verify_data mismatch");
 
     // 6. 应用密钥 + 客户端 Finished
-    const derived2 = await hkdfExpandLabel(hsSecret, "derived", emptyHash, 32);
+    // v2.1 优化：derived2 与 th3 并行；三个应用期推导并行
+    const [derived2, th3] = await Promise.all([
+      hkdfExpandLabel(hsSecret, "derived", emptyHash, 32),
+      sha256(concatBytes(this.transcript)), // CH..server Finished（含 SF）
+    ]);
     const masterSecret = await hkdfExtract(derived2, zeros32);
-    const th3 = await sha256(concatBytes(this.transcript)); // CH..server Finished（含 SF）
-    const cAp = await hkdfExpandLabel(masterSecret, "c ap traffic", th3, 32);
-    const sAp = await hkdfExpandLabel(masterSecret, "s ap traffic", th3, 32);
-    const cFinKey = await hkdfExpandLabel(cHs, "finished", new Uint8Array(0), 32);
+    const [cAp, sAp, cFinKey] = await Promise.all([
+      hkdfExpandLabel(masterSecret, "c ap traffic", th3, 32),
+      hkdfExpandLabel(masterSecret, "s ap traffic", th3, 32),
+      hkdfExpandLabel(cHs, "finished", new Uint8Array(0), 32),
+    ]);
     const cfData = await hmacSha256(cFinKey, th3);
     const cfRaw = concatBytes([new Uint8Array([20]), u24(cfData.length), cfData]);
-    await this.writeRecord(0x16, cfRaw); // 客户端 Finished（c_hs 密钥）
+    await this.writeRecord(0x16, cfRaw); // 客户端 Finished（c_hs 密钥；必须在 install 覆盖 cKeys 之前完成）
     this.transcript.push(cfRaw);
 
-    await this.cKeys.install(cAp);
-    await this.sKeys.install(sAp);
+    // v2.1 优化：两套应用密钥安装并行
+    await Promise.all([this.cKeys.install(cAp), this.sKeys.install(sAp)]);
     this.cSecretApp = cAp;
     this.sSecretApp = sAp;
     this.appPhase = true;
@@ -770,12 +823,21 @@ export class Tls13Client {
 
   // ---- 应用数据 ----
 
-  /** 写应用数据（自动按 16KB 分片） */
+  /** 写应用数据（自动按 16KB 分片；v2.1：多分片并行加密 + 批量写） */
   async write(bytes: Uint8Array): Promise<void> {
     if (this.closed || this.peerClosed) throw new Error("tls13: connection closed");
     if (!this.appPhase) throw new Error("tls13: handshake not completed");
+    if (bytes.length <= MAX_RECORD) {
+      await this.writeRecord(0x17, bytes);
+      return;
+    }
+    const chunks: Uint8Array[] = [];
     for (let off = 0; off < bytes.length; off += MAX_RECORD) {
-      await this.writeRecord(0x17, bytes.slice(off, off + MAX_RECORD));
+      chunks.push(bytes.slice(off, off + MAX_RECORD));
+    }
+    const BATCH = 256; // ≈4MB 密文/批，约束峰值内存
+    for (let i = 0; i < chunks.length; i += BATCH) {
+      await this.writeRecordsBatch(0x17, chunks.slice(i, i + BATCH));
     }
   }
 
@@ -908,6 +970,14 @@ export class Tls13Client {
 
   // ---- 证书链校验 ----
 
+  // v2.1：isolate 级证书链验签缓存。
+  // 上游（Google）整条证书链数月不变（叶子证书有效期约 90 天），而链签名验证
+  // （leaf←intermediate 的 RSA-PSS + intermediate←root 的 ECDSA/RSA，共 2-3 次非对称
+  // 验签）是握手 CPU 的大头（约 2-4ms）。同一 isolate 内重复握手时按「整链 DER 的
+  // SHA-256」缓存链签名+锚定结论：字节完全相同的链必然得出相同结论（签名与锚定
+  // 均只由证书内容决定）；SAN 匹配与有效期（时间相关）仍每次校验。
+  // 缓存条目随叶子证书 notAfter 过期自动失效，并设 24h 上限做卫生截断；容量 32 条
+  // （Map 插入序即 LRU 语义，超容先删最旧）。
   private async validateChain(certs: Uint8Array[], leaf: ParsedCert): Promise<void> {
     // 1) SAN + 有效期
     let sanOk = false;
@@ -922,13 +992,22 @@ export class Tls13Client {
     if (now < leaf.notBefore - 5 * 60_000 || now > leaf.notAfter) {
       this.fail("certificate expired or not yet valid");
     }
-    // 2) 逐级验签：certs[i] 由 certs[i+1] 签发
-    const parsed = certs.map((c) => parseCertificate(c));
-    for (let i = 0; i + 1 < parsed.length; i++) {
-      const ok = await verifySignature(parsed[i].tbs, parsed[i].signature, parsed[i], parsed[i + 1]);
-      if (!ok) this.fail("certificate signature verification failed at chain index " + i);
+    // 2) 缓存命中：跳过链签名 + 锚定（结论只由证书字节决定，重复计算纯属浪费）
+    const cacheKey = toHex(await sha256(concatBytes(certs)));
+    const cached = chainVerifyCache.get(cacheKey);
+    const validUntil = Math.min(leaf.notAfter, now + 24 * 3600_000);
+    if (cached && now < cached) {
+      return;
     }
-    // 3) 信任锚：链尾 SPKI 直接命中；或链尾证书的签名可由锚公钥验过
+    // 3) 逐级验签：certs[i] 由 certs[i+1] 签发 —— 各级验证相互独立，并行执行
+    const parsed = certs.map((c) => parseCertificate(c));
+    const linkOks = await Promise.all(
+      parsed.slice(0, -1).map((cert, i) => verifySignature(cert.tbs, cert.signature, cert, parsed[i + 1])),
+    );
+    for (let i = 0; i < linkOks.length; i++) {
+      if (!linkOks[i]) this.fail("certificate signature verification failed at chain index " + i);
+    }
+    // 4) 信任锚：链尾 SPKI 直接命中；或链尾证书的签名可由锚公钥验过
     //    （覆盖「服务器只送 leaf+intermediate、不带根」和「带交叉签名根」两种链形态）
     const anchors = this.opts.trustAnchors ?? trustAnchors();
     const last = parsed[parsed.length - 1];
@@ -940,21 +1019,27 @@ export class Tls13Client {
       }
     }
     if (!anchored) {
-      for (const a of anchors) {
-        const anchorInfo = parseSpki(a);
-        const signer: ParsedCert = { ...last, spki: a, spkiAlgOid: anchorInfo.spkiAlgOid, curveOid: anchorInfo.curveOid };
-        try {
-          const ok = await verifySignature(last.tbs, last.signature, last, signer);
-          if (ok) {
-            anchored = true;
-            break;
+      // v2.1：各锚的验签尝试相互独立，并行执行
+      const anchorOks = await Promise.all(
+        anchors.map(async (a) => {
+          const anchorInfo = parseSpki(a);
+          const signer: ParsedCert = { ...last, spki: a, spkiAlgOid: anchorInfo.spkiAlgOid, curveOid: anchorInfo.curveOid };
+          try {
+            return await verifySignature(last.tbs, last.signature, last, signer);
+          } catch {
+            return false; // 该锚不适用，尝试下一个
           }
-        } catch {
-          // 尝试下一个锚
-        }
-      }
+        }),
+      );
+      anchored = anchorOks.some((ok) => ok);
     }
     if (!anchored) this.fail("certificate chain does not terminate at a pinned trust anchor");
+    // 5) 写入缓存（容量控制：插入序 LRU）
+    if (chainVerifyCache.size >= CHAIN_CACHE_MAX) {
+      const oldest = chainVerifyCache.keys().next().value;
+      if (oldest !== undefined) chainVerifyCache.delete(oldest);
+    }
+    chainVerifyCache.set(cacheKey, validUntil);
   }
 
   private async verifyTlsSignature(

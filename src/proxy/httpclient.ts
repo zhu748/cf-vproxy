@@ -41,8 +41,9 @@ export async function writeTunnelRequest(
   lines.push("Content-Length: " + req.body.length);
   lines.push("Connection: close");
   const head = new TextEncoder().encode(lines.join("\r\n") + "\r\n\r\n");
-  await writer.write(head);
-  if (req.body.length > 0) await writer.write(req.body);
+  // v2.1：头+体合并为单次 write —— tls13 层对单次写入做并行加密分批，
+  // 少一次底层写调用，TCP 打包也更好（头体常落在同一批次）
+  await writer.write(req.body.length > 0 ? concatBytes([head, req.body]) : head);
 }
 
 /** 解析响应头块（含 \r\n\r\n 的完整字节块）→ 状态/原因/头部 */
